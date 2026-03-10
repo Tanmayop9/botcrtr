@@ -161,13 +161,19 @@ MAX_CAPTCHA_POLL_ATTEMPTS = 36
 MAX_CAPTCHA_ATTEMPTS = 2
 
 # ---------------------------------------------------------------------------
-# Own hCaptcha solver -- Groq-powered
+# Own hCaptcha solver -- Groq-powered + Multibot-powered
 # ---------------------------------------------------------------------------
 # hCaptcha public API endpoints
 _HCAPTCHA_API_JS_URL       = "https://hcaptcha.com/1/api.js"
 _HCAPTCHA_SITE_CONFIG_URL  = "https://hcaptcha.com/checksiteconfig"
 _HCAPTCHA_GET_CHALLENGE_URL = "https://hcaptcha.com/getcaptcha"
 _HCAPTCHA_CHECK_URL        = "https://hcaptcha.com/checkcaptcha"
+
+# Multibot API base URL (https://multibot.in)
+_MULTIBOT_BASE_URL = "http://api.multibot.in"
+# Multibot polling: up to _MULTIBOT_POLL_ATTEMPTS * _MULTIBOT_POLL_INTERVAL s
+_MULTIBOT_POLL_ATTEMPTS = 30
+_MULTIBOT_POLL_INTERVAL = 2
 
 # Llama 4 Maverick: 17 B params / 128 experts -- best Groq vision model
 GROQ_DEFAULT_MODEL = "llama-4-maverick-17b-128e-instruct"
@@ -1493,6 +1499,268 @@ def _solve_hcaptcha_groq(
     )
 
 
+def _multibot_solve_challenge(
+    api_key: str,
+    req_type: str,
+    tasklist: list,
+    requester_question: dict,
+    requester_question_example: list,
+) -> dict:
+    """
+    Submit an hCaptcha challenge to the Multibot API (multibot.in) and poll
+    for the solved answers.
+
+    Multibot's ``hCaptchaRequester`` task type accepts the raw challenge data
+    (request type, question, task list) and returns a dict of
+    ``task_key -> answer`` values ready to submit directly to hCaptcha's
+    ``/checkcaptcha`` endpoint.
+
+    Raises ``RuntimeError`` if the task fails, times out, or the API returns
+    an unexpected response.
+    """
+    task_payload: dict = {
+        "clientKey": api_key,
+        "type": "hCaptchaRequester",
+        "task": {
+            "request_type": req_type,
+            "requester_question": requester_question,
+            "requester_question_example": requester_question_example,
+            "tasklist": tasklist,
+        },
+    }
+    cr = requests.post(
+        f"{_MULTIBOT_BASE_URL}/createTask",
+        json=task_payload,
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    cr.raise_for_status()
+    cd: dict = cr.json()
+    if cd.get("errorId") not in (0, None):
+        raise RuntimeError(
+            f"Multibot createTask error (id={cd.get('errorId')}): "
+            f"{cd.get('errorDescription', cd)}"
+        )
+    task_id = cd.get("taskId")
+    if not task_id:
+        raise RuntimeError(
+            f"Multibot createTask returned no taskId: {cd}"
+        )
+
+    for _ in range(_MULTIBOT_POLL_ATTEMPTS):
+        time.sleep(_MULTIBOT_POLL_INTERVAL)
+        rr = requests.post(
+            f"{_MULTIBOT_BASE_URL}/getTaskResult",
+            json={"clientKey": api_key, "taskId": task_id},
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        rr.raise_for_status()
+        rd: dict = rr.json()
+        if rd.get("errorId") not in (0, None):
+            raise RuntimeError(
+                f"Multibot getTaskResult error (id={rd.get('errorId')}): "
+                f"{rd.get('errorDescription', rd)}"
+            )
+        status: str = rd.get("status", "")
+        if status == "ready":
+            answers = rd.get("answers")
+            if isinstance(answers, dict) and answers:
+                return answers
+            raise RuntimeError(
+                f"Multibot task ready but answers missing or empty: {rd}"
+            )
+        if status == "error":
+            raise RuntimeError(
+                f"Multibot task failed with error status: {rd}"
+            )
+        # status == "processing" -- keep polling
+
+    raise RuntimeError(
+        f"Multibot: timed out after {_MULTIBOT_POLL_ATTEMPTS * _MULTIBOT_POLL_INTERVAL}s "
+        "waiting for task result."
+    )
+
+
+def _solve_hcaptcha_multibot(
+    sitekey: str,
+    pageurl: str,
+    rqdata: str,
+    multibot_api_key: str,
+) -> str:
+    """
+    Solve an hCaptcha challenge using the Multibot API (multibot.in).
+
+    Pipeline
+    --------
+    1. Fetch hCaptcha site config to obtain the proof-of-work descriptor and
+       the current JS bundle version.
+    2. Solve the PoW (``hsl`` / ``hsw`` / ``enterprise``) in pure Python.
+    3. POST to ``/getcaptcha`` with realistic mouse-movement motion data to
+       retrieve the image challenge.
+    4. Send the raw challenge data (request type, question, task list) to the
+       Multibot ``hCaptchaRequester`` API and poll for solved answers.
+    5. POST the answers with motion data to ``/checkcaptcha``.
+    6. If answers are rejected, re-fetch a fresh challenge and retry up to
+       ``_HCAPTCHA_SOLVE_RETRIES`` additional times before raising.
+    7. Return the ``generated_pass_UUID`` token.
+
+    Raises ``RuntimeError`` when Multibot returns an error or hCaptcha
+    rejects the submitted answers on all retry attempts.
+    """
+    host = urlparse(pageurl).hostname or "discord.com"
+
+    # -- 1. Site config -------------------------------------------------------
+    print("    [hCaptcha/Multibot] Fetching site config ...")
+    version = _hcaptcha_get_version()
+    cfg_resp = requests.get(
+        _HCAPTCHA_SITE_CONFIG_URL,
+        params={"v": version, "host": host, "sitekey": sitekey, "sc": "1", "swa": "1"},
+        headers=_HCAPTCHA_HEADERS,
+        timeout=15,
+    )
+    cfg_resp.raise_for_status()
+    config = cfg_resp.json()
+    c_obj: dict = config.get("c") or {}
+
+    # -- 2. Proof-of-work -----------------------------------------------------
+    def _solve_pow(c: dict) -> str:
+        ptype = (c.get("type") or "").lower()
+        if ptype == "hsl":
+            sol = _hcaptcha_solve_hsl_pow(c.get("req", ""))
+            print("    [hCaptcha/Multibot] PoW (hsl) solved.")
+            return sol
+        if ptype in ("hsw", "enterprise"):
+            print("    [hCaptcha/Multibot] Solving hsw PoW ...")
+            sol = _hcaptcha_solve_hsw_pow(c.get("req", ""))
+            print("    [hCaptcha/Multibot] PoW (hsw) solved.")
+            return sol
+        return ""
+
+    pow_type_label = (c_obj.get("type") or "(none)").lower()
+    print(f"    [hCaptcha/Multibot] PoW type: {pow_type_label}")
+    pow_solution = _solve_pow(c_obj)
+
+    # -- Outer retry loop: re-fetch challenge if answers are rejected ----------
+    result: dict = {}
+    for solve_attempt in range(1 + _HCAPTCHA_SOLVE_RETRIES):
+        if solve_attempt > 0:
+            print(
+                f"    [hCaptcha/Multibot] Answers rejected; "
+                f"re-fetching challenge (attempt {solve_attempt + 1}) ..."
+            )
+            pow_solution = _solve_pow(c_obj)
+
+        # -- 3. Get challenge -------------------------------------------------
+        if solve_attempt == 0:
+            print("    [hCaptcha/Multibot] Fetching challenge ...")
+        ts_ms = int(time.time() * 1000)
+        motion_get = _generate_motion_data(ts_ms)
+        getcap_form: dict = {
+            "v":          version,
+            "host":       host,
+            "sitekey":    sitekey,
+            "sc":         "1",
+            "swa":        "1",
+            "motionData": json.dumps(motion_get),
+            "pdc":        json.dumps({"s": ts_ms, "n": 0, "p": 0, "gcs": 10}),
+            "n":          pow_solution,
+            "c":          json.dumps(c_obj),
+        }
+        if rqdata:
+            getcap_form["rqdata"] = rqdata
+
+        cap_resp = requests.post(
+            f"{_HCAPTCHA_GET_CHALLENGE_URL}/{sitekey}",
+            data=getcap_form,
+            headers=_HCAPTCHA_HEADERS,
+            timeout=20,
+        )
+        cap_resp.raise_for_status()
+        challenge: dict = cap_resp.json()
+
+        # Some easy challenges pass immediately without image tasks.
+        if challenge.get("generated_pass_UUID"):
+            print("    [hCaptcha/Multibot] Challenge passed automatically (no images).")
+            return challenge["generated_pass_UUID"]
+
+        req_type: str = challenge.get("request_type", "")
+        if not req_type and challenge.get("tasklist"):
+            req_type = "image_label_binary"
+
+        tasklist: list = challenge.get("tasklist", [])
+        challenge_key: str = challenge.get("key", "")
+        c_next: dict = challenge.get("c") or c_obj
+
+        if not tasklist:
+            continue
+
+        question_dict: dict = challenge.get("requester_question", {})
+        question_example: list = challenge.get("requester_question_example", [])
+
+        # -- 4. Solve via Multibot API ----------------------------------------
+        print(
+            f"    [hCaptcha/Multibot] Sending {len(tasklist)} task(s) "
+            f"[{req_type}] to Multibot ..."
+        )
+        try:
+            answers: dict = _multibot_solve_challenge(
+                api_key=multibot_api_key,
+                req_type=req_type,
+                tasklist=tasklist,
+                requester_question=question_dict,
+                requester_question_example=question_example,
+            )
+        except RuntimeError as exc:
+            print(f"    [hCaptcha/Multibot] Multibot error: {exc}")
+            continue
+
+        if not answers:
+            print("    [hCaptcha/Multibot] Multibot returned empty answers; retrying ...")
+            continue
+
+        # -- 5. Submit answers ------------------------------------------------
+        print("    [hCaptcha/Multibot] Submitting answers ...")
+        second_pow = _solve_pow(c_next) if isinstance(c_next, dict) else ""
+        ts_ms2 = int(time.time() * 1000)
+        motion_check = _generate_motion_data(ts_ms2)
+        submit_payload: dict = {
+            "v":          version,
+            "job_mode":   req_type,
+            "answers":    answers,
+            "serverdomain": host,
+            "sitekey":    sitekey,
+            "n":          second_pow or pow_solution,
+            "c": (
+                json.dumps(c_next)
+                if isinstance(c_next, dict)
+                else (c_next or json.dumps(c_obj))
+            ),
+            "motionData": json.dumps(motion_check),
+        }
+        submit_resp = requests.post(
+            f"{_HCAPTCHA_CHECK_URL}/{sitekey}/{challenge_key}",
+            json=submit_payload,
+            headers={**_HCAPTCHA_HEADERS, "Content-Type": "application/json"},
+            timeout=20,
+        )
+        submit_resp.raise_for_status()
+        result = submit_resp.json()
+
+        token: str = result.get("generated_pass_UUID", "")
+        if token:
+            print("    [hCaptcha/Multibot] Challenge solved successfully.")
+            return token
+
+        # Answers were rejected; loop will retry if attempts remain.
+
+    raise RuntimeError(
+        f"hCaptcha: challenge not accepted after "
+        f"{1 + _HCAPTCHA_SOLVE_RETRIES} attempt(s) -- "
+        f"last response: {result}"
+    )
+
+
 def _solve_hcaptcha(
     sitekey: str,
     pageurl: str,
@@ -1510,6 +1778,11 @@ def _solve_hcaptcha(
                             Llama 4 Maverick vision (recommended, free tier).
                             *solver_key* must be a Groq API key.
                             Install: pip install groq>=1.1.0
+    "multibot"           -- Delegate image analysis to Multibot API
+                            (multibot.in).  PoW and challenge fetch are
+                            handled locally; only the image-classification
+                            step is offloaded.  *solver_key* must be a
+                            Multibot API key.  Get one at multibot.in
     "2captcha" / "2cap"  -- Delegate to https://2captcha.com (paid).
     "capsolver" / "cap"  -- Delegate to https://capsolver.com (paid).
 
@@ -1525,6 +1798,14 @@ def _solve_hcaptcha(
             rqdata=rqdata,
             groq_api_key=solver_key,
             groq_model=groq_model,
+        )
+
+    if svc == "multibot":
+        return _solve_hcaptcha_multibot(
+            sitekey=sitekey,
+            pageurl=pageurl,
+            rqdata=rqdata,
+            multibot_api_key=solver_key,
         )
 
     if svc in ("2captcha", "2cap"):
@@ -1604,7 +1885,7 @@ def _solve_hcaptcha(
 
     raise RuntimeError(
         f"Unknown captcha solver service: {solver_service!r}. "
-        "Use 'groq', '2captcha', or 'capsolver'."
+        "Use 'groq', 'multibot', '2captcha', or 'capsolver'."
     )
 
 
@@ -1635,8 +1916,9 @@ def api_create_application(
                     raise RuntimeError(
                         f"create application: HTTP {resp.status_code} -- {body}\n"
                         "  Discord requires a captcha solution.  Re-run the script\n"
-                        "  and supply a captcha solver API key (groq, 2captcha, or\n"
-                        "  capsolver) when prompted, or use Method 2 (Browser) instead."
+                        "  and supply a captcha solver API key (groq, multibot,\n"
+                        "  2captcha, or capsolver) when prompted, or use Method 2\n"
+                        "  (Browser) instead."
                     )
                 if attempt > 0:
                     raise RuntimeError(
@@ -2237,12 +2519,15 @@ def main() -> None:
             f"  groq{groq_note}\n"
             "      Built-in Llama 4 vision solver via Groq API.\n"
             "      Free API key: https://console.groq.com\n"
+            "  multibot  -- Multibot AI solver (multibot.in).\n"
+            "      Offloads image analysis to Multibot; PoW handled locally.\n"
+            "      API key required: https://multibot.in\n"
             "  2captcha  -- paid service: https://2captcha.com\n"
             "  capsolver -- paid service: https://capsolver.com\n"
             "  Leave blank to skip (an error will appear if a captcha is triggered).\n"
         )
         svc_raw = input(
-            "Captcha solver service [groq/2captcha/capsolver, leave blank to skip]: "
+            "Captcha solver service [groq/multibot/2captcha/capsolver, leave blank to skip]: "
         ).strip().lower()
         if svc_raw in ("groq",):
             solver_service = "groq"
@@ -2255,6 +2540,11 @@ def main() -> None:
             ).strip()
             if model_raw:
                 groq_model = model_raw
+        elif svc_raw == "multibot":
+            solver_service = "multibot"
+            solver_key = input(
+                "Multibot API key (get one at multibot.in): "
+            ).strip()
         elif svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
             solver_service = svc_raw
             solver_key = input(
