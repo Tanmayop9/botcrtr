@@ -10,7 +10,14 @@ Supports two automation methods -- user picks at runtime:
 
     hCaptcha handling (Method 1):
       Discord sometimes demands an hCaptcha solution when creating an
-      application.  Three solver options are available:
+      application.  Four solver options are available:
+
+        "browser"  -- Manual browser solver (RECOMMENDED for Replit).
+                      Starts a tiny web server on port 8080 and displays
+                      the hCaptcha widget in your Replit preview tab (or
+                      any browser at http://localhost:8080).  Solve it
+                      once and the bot continues automatically.
+                      No API key or extra packages required.
 
         "groq"     -- Built-in solver powered by the official Groq Python SDK
                       and the Llama 4 Maverick vision model.  FREE tier
@@ -60,6 +67,14 @@ Supports two automation methods -- user picks at runtime:
     On desktop: Chrome or Firefox with matching driver.
     Needs: pip install -r requirements.txt  (includes selenium + webdriver-manager)
 
+    Steps performed automatically:
+      1. Log in with user token (localStorage injection)
+      2. Create a new Discord application
+      3. Add a bot user ("Add Bot" button)
+      4. Reset / copy the bot token  (2FA handled automatically via TOTP)
+      5. Enable all three Privileged Gateway Intents
+      6. Add the bot to a server / guild
+
 Per-bot steps (both methods):
   1. Create a new Discord application
   2. Attach a bot user
@@ -75,6 +90,10 @@ Termux usage:
 Desktop usage:
     pip install -r requirements.txt
     python create_discord_bot.py  # select Method 1 or 2
+
+Replit usage:
+    pip install -r requirements.txt
+    python create_discord_bot.py  # select Method 1; choose "browser" as captcha solver
 
 Dependencies:
     requests>=2.28.0,<3.0.0          # both methods
@@ -93,7 +112,10 @@ import hashlib
 import json
 import random
 import re
+import socket
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 import pyotp
@@ -159,6 +181,116 @@ WAIT_TIMEOUT = 45
 MAX_CAPTCHA_POLL_ATTEMPTS = 36
 # Maximum number of application-creation attempts (initial + captcha retry)
 MAX_CAPTCHA_ATTEMPTS = 2
+
+# ---------------------------------------------------------------------------
+# Browser / Replit preview-tab captcha solver
+# ---------------------------------------------------------------------------
+# HTTP port for the built-in captcha web server (Replit exposes port 8080).
+# The solver tries this port first; if it is taken it falls back to 3000,
+# 5000, 8000, 8888, and finally lets the OS pick a free port.
+_CAPTCHA_WEB_SERVER_PORT = 8080
+
+# HTML page served to the user.  {sitekey} and {rqdata_attr} are expanded at
+# runtime; all other {{ / }} pairs are literal CSS / JS braces.
+_CAPTCHA_PAGE_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Solve Captcha &ndash; Discord Bot Creator</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      background: #23272a;
+      color: #dcddde;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: #2c2f33;
+      border-radius: 10px;
+      padding: 32px 28px;
+      max-width: 520px;
+      width: 100%;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+      text-align: center;
+    }}
+    h1 {{ font-size: 1.5rem; color: #7289da; margin-bottom: 8px; }}
+    .subtitle {{ color: #b9bbbe; font-size: 0.9rem; margin-bottom: 24px; }}
+    .captcha-wrap {{ display: flex; justify-content: center; margin: 20px 0; }}
+    #status {{
+      margin-top: 20px;
+      padding: 12px 16px;
+      border-radius: 6px;
+      background: #36393f;
+      font-size: 0.9rem;
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .pending {{ color: #b9bbbe; }}
+    .sending {{ color: #faa61a; }}
+    .done    {{ color: #43b581; }}
+    .error   {{ color: #f04747; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Discord Bot Creator</h1>
+    <p class="subtitle">
+      A captcha is required to continue.<br>
+      Please solve it below &mdash; the bot will resume automatically.
+    </p>
+    <div class="captcha-wrap">
+      <div class="h-captcha"
+           data-sitekey="{sitekey}"
+           data-host="discord.com"
+           {rqdata_attr}
+           data-callback="onSolved"
+           data-error-callback="onError">
+      </div>
+    </div>
+    <div id="status" class="pending">Waiting for you to solve the captcha&hellip;</div>
+  </div>
+  <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
+  <script>
+    function setStatus(cls, msg) {{
+      var s = document.getElementById('status');
+      s.className = cls;
+      s.textContent = msg;
+    }}
+    function onSolved(token) {{
+      setStatus('sending', 'Captcha solved! Sending token to bot\u2026');
+      fetch('/captcha-solved', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ token: token }})
+      }})
+      .then(function(r) {{ return r.json(); }})
+      .then(function(d) {{
+        if (d.ok) {{
+          setStatus('done', '\u2713 Done! The bot will continue. You can close this tab.');
+        }} else {{
+          setStatus('error', 'Error: ' + (d.error || 'unknown'));
+        }}
+      }})
+      .catch(function(e) {{
+        setStatus('error', 'Network error: ' + e);
+      }});
+    }}
+    function onError(err) {{
+      setStatus('error', 'Captcha widget error: ' + err + '. Please refresh the page and try again.');
+    }}
+  </script>
+</body>
+</html>
+"""
 
 # ---------------------------------------------------------------------------
 # Own hCaptcha solver -- Groq-powered + Gemini-powered (both free)
@@ -2342,6 +2474,135 @@ def _solve_hcaptcha_groq(
     )
 
 
+def _solve_hcaptcha_manual_browser(sitekey: str, pageurl: str, rqdata: str) -> str:
+    """
+    Serve a local web page with an embedded hCaptcha widget and wait for the
+    user to solve it manually in a browser (Replit preview tab or localhost).
+
+    The widget is loaded with ``data-host="discord.com"`` so the generated
+    token is bound to the ``discord.com`` origin and accepted by Discord's
+    verification endpoint.
+
+    Workflow
+    --------
+    1. A tiny HTTP server starts on ``_CAPTCHA_WEB_SERVER_PORT`` (default 8080).
+    2. The script prints the URL to open (Replit preview tab URL when running
+       on Replit, otherwise ``http://localhost:<port>``).
+    3. The user opens the URL, solves the hCaptcha widget, and the browser
+       POSTs the token back to ``/captcha-solved``.
+    4. This function returns the token string so the caller can retry the
+       Discord API request with ``captcha_key`` set.
+
+    Raises ``RuntimeError`` if the server cannot be started or the captcha
+    is not solved within ``MAX_CAPTCHA_POLL_ATTEMPTS * 5`` seconds (~3 min).
+    """
+    solved_event: threading.Event = threading.Event()
+    result_container: dict = {}
+
+    rqdata_attr = f'data-rqdata="{rqdata}"' if rqdata else ""
+    page_html = _CAPTCHA_PAGE_HTML.format(
+        sitekey=sitekey,
+        rqdata_attr=rqdata_attr,
+    ).encode("utf-8")
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args) -> None:  # suppress access-log noise
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path in ("/", "/index.html", "/captcha"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page_html)))
+                self.end_headers()
+                self.wfile.write(page_html)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path == "/captcha-solved":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(length)
+                    data = json.loads(body.decode("utf-8"))
+                    token = str(data.get("token", "")).strip()
+                    if not token:
+                        raise ValueError("empty token")
+                    result_container["token"] = token
+                    solved_event.set()
+                    resp = json.dumps({"ok": True}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers()
+                    self.wfile.write(resp)
+                except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                    err = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    # Bind to 0.0.0.0 (all interfaces) so the server is reachable from the
+    # Replit preview tab, which proxies from an external URL to the container.
+    # Try the preferred port, then common fallbacks, then let the OS choose.
+    server: HTTPServer | None = None
+    port = _CAPTCHA_WEB_SERVER_PORT
+    for _p in (port, 3000, 5000, 8000, 8888, 0):
+        try:
+            server = HTTPServer(("0.0.0.0", _p), _Handler)
+            port = server.server_address[1]
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise RuntimeError(
+            "manual captcha solver: could not bind to any port. "
+            "Free up port 8080 and try again."
+        )
+
+    # Build the URL to show the user.
+    replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
+    repl_slug     = os.environ.get("REPL_SLUG", "")
+    repl_owner    = os.environ.get("REPL_OWNER", "")
+    if replit_domain:
+        url = f"https://{replit_domain}"
+    elif repl_slug and repl_owner:
+        url = f"https://{repl_slug}.{repl_owner}.repl.co"
+    else:
+        url = f"http://localhost:{port}"
+
+    print(
+        f"\n    [Captcha] Web server started on port {port}.\n"
+        f"    [Captcha] Open your Replit preview tab or visit:\n"
+        f"    [Captcha]   {url}\n"
+        f"    [Captcha] Solve the captcha in your browser to continue.\n"
+    )
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    timeout_secs = MAX_CAPTCHA_POLL_ATTEMPTS * 5  # ~3 minutes
+    if not solved_event.wait(timeout=timeout_secs):
+        server.shutdown()
+        raise RuntimeError(
+            f"manual captcha solver: timed out after {timeout_secs}s "
+            "waiting for the captcha to be solved."
+        )
+    server.shutdown()
+
+    token = result_container.get("token", "")
+    if not token:
+        raise RuntimeError("manual captcha solver: received an empty token.")
+    print("    [Captcha] Token received. Resuming ...")
+    return token
+
+
 def _solve_hcaptcha(
     sitekey: str,
     pageurl: str,
@@ -2367,11 +2628,22 @@ def _solve_hcaptcha(
                             Free key: https://aistudio.google.com/apikey
     "2captcha" / "2cap"  -- Delegate to https://2captcha.com (paid).
     "capsolver" / "cap"  -- Delegate to https://capsolver.com (paid).
+    "browser"            -- Serve an hCaptcha page on a local web server so
+                            the operator can solve it manually in a browser
+                            (Replit preview tab or localhost).  No API key
+                            needed; uses ``_solve_hcaptcha_manual_browser``.
 
     Returns the token string to embed in ``captcha_key`` when retrying
     the Discord application creation request.
     """
     svc = solver_service.lower()
+
+    if svc in ("browser", "manual"):
+        return _solve_hcaptcha_manual_browser(
+            sitekey=sitekey,
+            pageurl=pageurl,
+            rqdata=rqdata,
+        )
 
     if svc == "groq":
         return _solve_hcaptcha_groq(
@@ -2468,7 +2740,7 @@ def _solve_hcaptcha(
 
     raise RuntimeError(
         f"Unknown captcha solver service: {solver_service!r}. "
-        "Use 'groq', 'gemini', '2captcha', or 'capsolver'."
+        "Use 'groq', 'gemini', '2captcha', 'capsolver', or 'browser'."
     )
 
 
@@ -2496,12 +2768,13 @@ def api_create_application(
             except Exception:
                 body = {}
             if "captcha_key" in body:
-                if not solver_key:
+                if not solver_key and solver_service.lower() not in ("browser", "manual"):
                     raise RuntimeError(
                         f"create application: HTTP {resp.status_code} -- {body}\n"
                         "  Discord requires a captcha solution.  Re-run the script\n"
                         "  and supply a captcha solver API key (groq, gemini,\n"
-                        "  2captcha, or capsolver) when prompted, or use Method 2\n"
+                        "  2captcha, or capsolver), choose the 'browser' solver\n"
+                        "  (for Replit preview-tab solving), or use Method 2\n"
                         "  (Browser) instead."
                     )
                 if attempt > 0:
@@ -2748,61 +3021,125 @@ def _click(driver, by, locator, timeout=WAIT_TIMEOUT):
 
 def _safe_toggle_intent(driver, label_text: str) -> None:
     """Enable the privileged intent toggle whose label contains *label_text*."""
-    try:
-        xpath = (
-            f"//div[contains(normalize-space(.),'{label_text}')]"
-            f"//input[@type='checkbox']|"
-            f"//h3[contains(normalize-space(.),'{label_text}')]"
-            f"/ancestor::div[contains(@class,'intent') or contains(@class,'Intent')]"
+    # Use translate() so the match is case-insensitive without Python post-processing.
+    upper = label_text.upper()
+    xpaths = (
+        # Pattern A: h3/h4 containing the label text -> ancestor row -> checkbox
+        (
+            f"//h3[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz',"
+            f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{upper}')]"
+            f"/ancestor::div[contains(@class,'intent') or contains(@class,'Intent')"
+            f" or contains(@class,'row') or contains(@class,'Row')][1]"
             f"//input[@type='checkbox']"
-        )
-        boxes = driver.find_elements(By.XPATH, xpath)
-        for cb in boxes:
-            if not cb.is_selected():
+        ),
+        # Pattern B: any div containing the label -> checkbox inside it
+        (
+            f"//div[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz',"
+            f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{upper}')]"
+            f"//input[@type='checkbox']"
+        ),
+        # Pattern C: role=switch / role=checkbox near the label
+        (
+            f"//div[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz',"
+            f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{upper}')]"
+            f"//*[@role='switch' or @role='checkbox']"
+        ),
+    )
+    try:
+        for xpath in xpaths:
+            boxes = driver.find_elements(By.XPATH, xpath)
+            if not boxes:
+                continue
+            cb = boxes[0]
+            checked = (
+                cb.is_selected()
+                or cb.get_attribute("aria-checked") in ("true", "1")
+                or cb.get_attribute("checked") is not None
+            )
+            if not checked:
                 driver.execute_script("arguments[0].click();", cb)
                 time.sleep(0.5)
                 print(f"    Enabled: {label_text}")
-                return
-        if boxes:
-            print(f"    Already enabled: {label_text}")
-        else:
-            print(f"    Could not locate toggle for: {label_text}")
+            else:
+                print(f"    Already enabled: {label_text}")
+            return
+        print(f"    Could not locate toggle for: {label_text}")
     except (TimeoutException, NoSuchElementException) as exc:
         print(f"    Warning toggling '{label_text}': {exc}")
 
 
+_BOT_TOKEN_PAT = re.compile(r"[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}")
+
+
 def _extract_token_from_dom(driver) -> str:
-    """Scan the DOM for a Discord bot token pattern (headless-safe)."""
-    import re
-    pat = re.compile(r'[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}')
-    candidates = driver.execute_script("""
-        var v=[];
-        document.querySelectorAll(
-            'input[type="text"],input:not([type]),textarea,[class*="token" i],[class*="Token"]'
-        ).forEach(function(e){if(e.value)v.push(e.value);if(e.textContent)v.push(e.textContent);});
-        return v;
-    """) or []
-    for text in candidates:
-        text = str(text).strip()
-        if pat.fullmatch(text):
-            return text
+    """Scan the page for a Discord bot token using multiple strategies."""
+    # Strategy 1: targeted element attributes / text content
+    try:
+        candidates = driver.execute_script("""
+            var v = [];
+            document.querySelectorAll(
+                'input[type="text"], input:not([type]), textarea, '
+                + '[class*="token" i], [class*="Token"], [data-text-as-pseudo-element]'
+            ).forEach(function(e) {
+                if (e.value)       v.push(e.value);
+                if (e.textContent) v.push(e.textContent);
+                var d = e.getAttribute('data-text-as-pseudo-element');
+                if (d) v.push(d);
+            });
+            return v;
+        """) or []
+        for text in candidates:
+            m = _BOT_TOKEN_PAT.search(str(text).strip())
+            if m:
+                return m.group(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Strategy 2: full page source scan
+    try:
+        m = _BOT_TOKEN_PAT.search(driver.page_source)
+        if m:
+            return m.group(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Strategy 3: all leaf-node text + value attributes
+    try:
+        texts = driver.execute_script("""
+            var v = [];
+            document.querySelectorAll('*').forEach(function(e) {
+                var val = e.getAttribute('value');
+                if (val && val.length > 20) v.push(val);
+                if (!e.children.length && e.textContent.trim().length > 20)
+                    v.push(e.textContent.trim());
+            });
+            return v;
+        """) or []
+        for text in texts:
+            m = _BOT_TOKEN_PAT.search(str(text))
+            if m:
+                return m.group(0)
+    except Exception:  # noqa: BLE001
+        pass
+
     return ""
 
 
 def browser_login(driver, user_token: str) -> None:
     """Inject user token into localStorage and redirect to the Discord app."""
-    print("\n  [1/5] Logging in with user token ...")
+    print("\n  [1/6] Logging in with user token ...")
     driver.get(LOGIN_URL)
-    time.sleep(2)
+    time.sleep(3)
     driver.execute_script(
-        "window.localStorage.setItem('token',JSON.stringify(arguments[0]));"
+        "window.localStorage.setItem('token', JSON.stringify(arguments[0]));"
         "window.location.replace('https://discord.com/channels/@me');",
         user_token,
     )
     try:
         WebDriverWait(driver, WAIT_TIMEOUT).until(
-            lambda d: "/login" not in d.current_url and "channels" in d.current_url
+            lambda d: "/login" not in d.current_url
         )
+        time.sleep(3)
         print("    Logged in.")
     except TimeoutException:
         raise RuntimeError(
@@ -2812,120 +3149,303 @@ def browser_login(driver, user_token: str) -> None:
 
 def browser_create_application(driver, app_name: str) -> str:
     """Navigate the Developer Portal to create a new application. Returns client_id."""
-    print(f"\n  [2/5] Creating application '{app_name}' ...")
+    print(f"\n  [2/6] Creating application '{app_name}' ...")
     driver.get(DEVELOPER_PORTAL_URL)
-    time.sleep(2)
-    _click(driver, By.XPATH, "//button[contains(normalize-space(.),'New Application')]")
-    time.sleep(1)
-    name_input = _wait_for(driver, By.XPATH, "//input[@placeholder or @name]")
-    name_input.clear()
-    name_input.send_keys(app_name)
-    try:
-        cb = driver.find_element(By.XPATH,
-            "//input[@type='checkbox' and (contains(@id,'tos') or contains(@id,'terms'))]")
-        if not cb.is_selected():
-            driver.execute_script("arguments[0].click();", cb)
-    except NoSuchElementException:
-        pass
-    _click(driver, By.XPATH, "//button[contains(normalize-space(.),'Create')]")
     time.sleep(3)
-    # Extract client ID from URL (.../applications/<CLIENT_ID>/information)
+
+    # Click "New Application"
+    _click(driver, By.XPATH,
+        "//button[contains(normalize-space(.),'New Application')]"
+        "|//a[contains(normalize-space(.),'New Application')]"
+    )
+    time.sleep(1)
+
+    # Find the application name input inside the modal (try progressively broader selectors)
+    name_input = None
+    for xpath in (
+        "//div[@role='dialog']//input[@type='text' or not(@type)]",
+        "//input[@maxlength and (@type='text' or not(@type))]",
+        "//input[@name='name' or @id='app-name']",
+        "//input[@placeholder]",
+    ):
+        try:
+            name_input = WebDriverWait(driver, 8).until(
+                EC.visibility_of_element_located((By.XPATH, xpath))
+            )
+            break
+        except TimeoutException:
+            continue
+    if name_input is None:
+        raise RuntimeError(
+            "Could not find the application name input field. "
+            "The Discord Developer Portal layout may have changed."
+        )
+
+    # Use JS to clear the field because React's synthetic event system may not
+    # register Selenium's element.clear() and would leave stale text visible.
+    driver.execute_script("arguments[0].value = '';", name_input)
+    name_input.click()
+    name_input.send_keys(app_name)
+    time.sleep(0.3)
+
+    # Accept TOS / agreement checkbox if present
+    for tos_xpath in (
+        "//input[@type='checkbox' and ("
+        "  contains(@id,'tos') or contains(@id,'terms') or contains(@id,'agree')"
+        "  or contains(@name,'tos') or contains(@name,'agree'))]",
+        "//div[@role='dialog']//input[@type='checkbox']",
+        "//input[@type='checkbox']",
+        "//div[@role='checkbox']",
+    ):
+        try:
+            cb = driver.find_element(By.XPATH, tos_xpath)
+            checked = cb.is_selected() or cb.get_attribute("aria-checked") == "true"
+            if not checked:
+                driver.execute_script("arguments[0].click();", cb)
+                time.sleep(0.3)
+            break
+        except NoSuchElementException:
+            continue
+
+    # Click Create (inside dialog first, then anywhere)
+    _click(driver, By.XPATH,
+        "//div[@role='dialog']//button[normalize-space(.)='Create']"
+        "|//button[normalize-space(.)='Create']"
+        "|//button[contains(normalize-space(.),'Create') "
+        "  and not(contains(normalize-space(.),'New'))]"
+    )
+
+    # Wait for navigation to the new application page
+    try:
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            lambda d: "/applications/" in d.current_url
+        )
+    except TimeoutException:
+        raise RuntimeError(
+            "Timed out waiting for the application to be created. "
+            "The TOS checkbox may not have been accepted, or the account may "
+            "require phone/email verification."
+        )
+    time.sleep(2)
+
+    # Extract client ID from URL:  .../applications/<CLIENT_ID>/...
     client_id = ""
     parts = driver.current_url.rstrip("/").split("/")
     for i, p in enumerate(parts):
-        if p == "applications" and i + 1 < len(parts) and parts[i + 1].isdigit():
-            client_id = parts[i + 1]
+        if p == "applications" and i + 1 < len(parts):
+            cid = parts[i + 1]
+            if cid.isdigit():
+                client_id = cid
             break
+
+    # DOM fallback for client ID
     if not client_id:
-        try:
-            el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((
-                By.XPATH,
-                "//div[contains(normalize-space(.),'Application ID')]/following-sibling::div|"
-                "//input[@aria-label='Application ID' or @id='app-id']"
-            )))
-            client_id = (el.get_attribute("value") or el.text).strip()
-        except TimeoutException:
-            pass
+        for xpath in (
+            "//div[contains(normalize-space(.),'Application ID')]"
+            "/following-sibling::div[1]",
+            "//input[@aria-label='Application ID' or @id='app-id'"
+            "  or contains(@id,'client-id')]",
+            "//*[normalize-space(text())='Application ID']/following::*[1]",
+        ):
+            try:
+                el = WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.XPATH, xpath))
+                )
+                val = (el.get_attribute("value") or el.text or "").strip()
+                if val.isdigit() and len(val) > 10:
+                    client_id = val
+                    break
+            except TimeoutException:
+                continue
+
     print(f"    Client ID: {client_id or '(not detected)'}")
     return client_id
 
 
-def browser_enable_intents_and_get_token(driver, totp_secret: str) -> str:
-    """On the Bot page: reset token (handle 2FA), enable intents, return token."""
+def browser_add_bot_user(driver, client_id: str) -> None:
+    """Navigate to the Bot page and click 'Add Bot' if no bot user exists yet."""
+    print("  [3/6] Adding bot user ...")
+
+    # Navigate directly to the Bot settings page when client_id is known
+    if client_id:
+        driver.get(f"{DEVELOPER_PORTAL_URL}/{client_id}/bot")
+        time.sleep(3)
+    else:
+        # Fallback: click the Bot link in the sidebar
+        try:
+            _click(driver, By.XPATH,
+                "//a[normalize-space(.)='Bot']"
+                "|//li//a[contains(@href,'/bot')]"
+                "|//nav//a[contains(normalize-space(.),'Bot')]",
+                timeout=10,
+            )
+            time.sleep(2)
+        except TimeoutException:
+            print("    Could not navigate to Bot page -- skipping Add Bot step.")
+            return
+
+    # If "Add Bot" button is present the app has no bot yet; click it
+    try:
+        add_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((
+            By.XPATH,
+            "//button[contains(normalize-space(.),'Add Bot')]",
+        )))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", add_btn)
+        add_btn.click()
+        time.sleep(1)
+
+        # Confirm the dialog
+        confirmed = False
+        for confirm_xpath in (
+            "//button[contains(normalize-space(.),'Yes, do it')]",
+            "//button[normalize-space(.)='Confirm']",
+            "//div[@role='dialog']//button[contains(@class,'danger') or contains(@class,'Danger')]",
+            "//div[@role='dialog']//button[last()]",
+        ):
+            try:
+                WebDriverWait(driver, 8).until(
+                    EC.element_to_be_clickable((By.XPATH, confirm_xpath))
+                ).click()
+                time.sleep(2)
+                confirmed = True
+                break
+            except TimeoutException:
+                continue
+        if confirmed:
+            print("    Bot user added.")
+        else:
+            print("    Confirmation dialog not found; proceeding anyway.")
+    except TimeoutException:
+        print("    'Add Bot' button not found -- bot user may already exist.")
+
+
+def browser_enable_intents_and_get_token(
+    driver, totp_secret: str, client_id: str = ""
+) -> str:
+    """On the Bot page: reset token (handle 2FA), enable intents, save, return token."""
+    # Navigate directly to the Bot page when we have the client ID
+    if client_id and f"{client_id}/bot" not in driver.current_url:
+        driver.get(f"{DEVELOPER_PORTAL_URL}/{client_id}/bot")
+        time.sleep(3)
+
     token = ""
 
-    # --- Reset token ---
+    # --- Reset / copy token ---
+    print("  [4/6] Resetting bot token ...")
     try:
         btn = _wait_click(driver, By.XPATH,
-            "//button[contains(normalize-space(.),'Reset Token')]", timeout=10)
+            "//button[contains(normalize-space(.),'Reset Token')]"
+            "|//button[contains(normalize-space(.),'Regenerate')]",
+            timeout=15,
+        )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
         btn.click()
         time.sleep(1)
 
-        # Confirmation modal
-        try:
-            _wait_click(driver, By.XPATH,
-                "//button[contains(normalize-space(.),'Yes, do it!') or "
-                "contains(normalize-space(.),'Confirm')]", timeout=10).click()
-            time.sleep(1)
-        except TimeoutException:
-            pass
+        # First confirmation modal ("Yes, do it!" / "Confirm")
+        for confirm_xpath in (
+            "//button[contains(normalize-space(.),'Yes, do it')]",
+            "//button[normalize-space(.)='Confirm']",
+            "//div[@role='dialog']//button[contains(@class,'danger') or contains(@class,'Danger')]",
+            "//div[@role='dialog']//button[last()]",
+        ):
+            try:
+                WebDriverWait(driver, 8).until(
+                    EC.element_to_be_clickable((By.XPATH, confirm_xpath))
+                ).click()
+                time.sleep(1)
+                break
+            except TimeoutException:
+                continue
 
-        # 2FA modal
+        # 2FA code entry (Discord may require it for token reset)
         try:
-            totp_input = WebDriverWait(driver, 8).until(EC.presence_of_element_located((
-                By.XPATH,
-                "//input[@placeholder='6-digit authentication code' or "
-                "@name='code' or @autocomplete='one-time-code' or "
-                "contains(@placeholder,'digit')]"
-            )))
+            totp_input = WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.XPATH,
+                    "//input[@autocomplete='one-time-code'"
+                    "  or @placeholder='6-digit authentication code'"
+                    "  or contains(@placeholder,'digit')"
+                    "  or @name='code']"
+                ))
+            )
             if not totp_secret:
                 raise RuntimeError(
-                    "Discord is asking for a 2FA code but no secret was provided."
+                    "Discord requires a 2FA code to reset the token, "
+                    "but no 2FA secret was provided."
                 )
             code = pyotp.TOTP(totp_secret).now()
             print(f"    Generated TOTP code: {code}")
             totp_input.clear()
             totp_input.send_keys(code)
             time.sleep(0.3)
-            try:
-                _wait_click(driver, By.XPATH,
-                    "//button[@type='submit' or contains(normalize-space(.),'Verify') "
-                    "or contains(normalize-space(.),'Log In')]", timeout=8).click()
-            except TimeoutException:
-                pass
+            for submit_xpath in (
+                "//button[@type='submit']",
+                "//button[contains(normalize-space(.),'Verify')]",
+                "//button[contains(normalize-space(.),'Log In')]",
+                "//div[@role='dialog']//button[last()]",
+            ):
+                try:
+                    WebDriverWait(driver, 6).until(
+                        EC.element_to_be_clickable((By.XPATH, submit_xpath))
+                    ).click()
+                    break
+                except TimeoutException:
+                    continue
             time.sleep(2)
         except TimeoutException:
-            pass  # no 2FA challenge
+            pass  # no 2FA prompt
 
-        # Revealed token from DOM
-        token_el = WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.presence_of_element_located((
-                By.XPATH,
-                "//div[contains(@class,'token') or @data-text-as-pseudo-element]"
-                "|//span[contains(@class,'token')]"
-            ))
-        )
-        token = token_el.text.strip()
+        # Give the portal time to reveal the token after reset
+        time.sleep(2)
+
+        # Extract token from known element patterns
+        for token_xpath in (
+            "//input[contains(@class,'token') or contains(@id,'token')"
+            "       or contains(@aria-label,'token') or contains(@aria-label,'Token')]",
+            "//span[contains(@class,'token')]",
+            "//div[contains(@class,'token') and not(contains(@class,'tokenRow'))]",
+            "//*[@data-text-as-pseudo-element]",
+        ):
+            try:
+                for el in driver.find_elements(By.XPATH, token_xpath):
+                    val = (
+                        el.get_attribute("value")
+                        or el.text
+                        or el.get_attribute("data-text-as-pseudo-element")
+                        or ""
+                    ).strip()
+                    m = _BOT_TOKEN_PAT.search(val)
+                    if m:
+                        token = m.group(0)
+                        break
+                if token:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
     except TimeoutException:
-        pass
+        print("    'Reset Token' button not found -- attempting token capture without reset.")
 
-    # DOM scan fallback (headless-safe)
+    # DOM scan fallback
     if not token:
         token = _extract_token_from_dom(driver)
         if token:
-            print("    Token extracted from DOM.")
+            print("    Token extracted via DOM scan.")
 
     # Clipboard fallback (non-headless only)
     if not token:
         try:
             _wait_click(driver, By.XPATH,
-                "//button[contains(normalize-space(.),'Copy')]", timeout=10).click()
+                "//button[contains(normalize-space(.),'Copy')]",
+                timeout=10,
+            ).click()
             time.sleep(0.5)
             token = driver.execute_async_script(
                 "var d=arguments[0];"
                 "navigator.clipboard.readText().then(d).catch(function(){d('');});"
             ) or ""
+            if token:
+                print("    Token captured via clipboard.")
         except (TimeoutException, NoSuchElementException):
             pass
 
@@ -2934,15 +3454,17 @@ def browser_enable_intents_and_get_token(driver, totp_secret: str) -> str:
     else:
         print("    Could not capture token automatically. Copy it manually from the portal.")
 
-    # --- Enable intents ---
-    print("  [4/5] Enabling Privileged Gateway Intents ...")
+    # --- Enable Privileged Gateway Intents ---
+    print("  [5/6] Enabling Privileged Gateway Intents ...")
     for label in ("PRESENCE INTENT", "SERVER MEMBERS INTENT", "MESSAGE CONTENT INTENT"):
         _safe_toggle_intent(driver, label)
 
     # --- Save changes ---
     try:
         _wait_click(driver, By.XPATH,
-            "//button[contains(normalize-space(.),'Save Changes')]", timeout=10).click()
+            "//button[contains(normalize-space(.),'Save Changes')]",
+            timeout=10,
+        ).click()
         time.sleep(2)
         print("    Changes saved.")
     except TimeoutException:
@@ -2953,7 +3475,7 @@ def browser_enable_intents_and_get_token(driver, totp_secret: str) -> str:
 
 def browser_add_to_server(driver, client_id: str, guild_id: str, permissions: str) -> None:
     """Navigate to the OAuth2 authorize page and click Authorise."""
-    print(f"\n  [5/5] Adding bot to server (guild {guild_id}) ...")
+    print(f"\n  [6/6] Adding bot to server (guild {guild_id}) ...")
     if not client_id:
         print("    Client ID missing -- skipping.")
         return
@@ -2965,25 +3487,41 @@ def browser_add_to_server(driver, client_id: str, guild_id: str, permissions: st
     )
     driver.get(oauth_url)
     time.sleep(3)
-    try:
-        el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((
-            By.XPATH,
-            f"//div[@data-guild-id='{guild_id}']|//option[@value='{guild_id}']"
-        )))
-        driver.execute_script("arguments[0].click();", el)
-        time.sleep(1)
-    except TimeoutException:
-        pass
+
+    # Select guild if prompted (some flows still show a picker)
+    for guild_xpath in (
+        f"//div[@data-guild-id='{guild_id}']",
+        f"//option[@value='{guild_id}']",
+        f"//div[contains(@class,'guild') or contains(@class,'Guild')]"
+        f"  [.//*[normalize-space(text())='{guild_id}']]",
+    ):
+        try:
+            el = WebDriverWait(driver, 6).until(
+                EC.presence_of_element_located((By.XPATH, guild_xpath))
+            )
+            driver.execute_script("arguments[0].click();", el)
+            time.sleep(1)
+            break
+        except TimeoutException:
+            continue
+
+    # Click Continue (scope confirmation page)
     try:
         _wait_click(driver, By.XPATH,
-            "//button[contains(normalize-space(.),'Continue')]", timeout=10).click()
+            "//button[contains(normalize-space(.),'Continue')]",
+            timeout=8,
+        ).click()
         time.sleep(2)
     except TimeoutException:
         pass
+
+    # Click Authorise
     try:
         _wait_click(driver, By.XPATH,
-            "//button[contains(normalize-space(.),'Authorise') or "
-            "contains(normalize-space(.),'Authorize')]", timeout=15).click()
+            "//button[contains(normalize-space(.),'Authorise')"
+            "  or contains(normalize-space(.),'Authorize')]",
+            timeout=15,
+        ).click()
         time.sleep(3)
         print("    Bot added to server.")
     except TimeoutException:
@@ -2993,10 +3531,8 @@ def browser_add_to_server(driver, client_id: str, guild_id: str, permissions: st
 def run_browser_bot(driver, bot_name: str, totp_secret: str, guild_id: str, permissions: str) -> str:
     """Run the full browser creation flow for one bot. Returns the token."""
     client_id = browser_create_application(driver, bot_name)
-    print("\n  [3/5] Navigating to Bot settings ...")
-    _click(driver, By.XPATH, "//a[normalize-space(.)='Bot']|//div[normalize-space(.)='Bot']")
-    time.sleep(2)
-    token = browser_enable_intents_and_get_token(driver, totp_secret)
+    browser_add_bot_user(driver, client_id)
+    token = browser_enable_intents_and_get_token(driver, totp_secret, client_id)
     save_token(token)
     if guild_id:
         browser_add_to_server(driver, client_id, guild_id, permissions)
@@ -3110,12 +3646,15 @@ def main() -> None:
             "      Built-in Google Gemini vision solver (REST API, no extra package).\n"
             "      Free API key: https://aistudio.google.com/apikey\n"
             "      Free tier: 1,500 req/day, 15 RPM for Flash models.\n"
+            "  browser  [free, no API key needed]  <-- RECOMMENDED for Replit\n"
+            "      Starts a web server on port 8080 so you can solve the captcha\n"
+            "      manually in the Replit preview tab (or any browser).\n"
             "  2captcha  -- paid service: https://2captcha.com\n"
             "  capsolver -- paid service: https://capsolver.com\n"
             "  Leave blank to skip (an error will appear if a captcha is triggered).\n"
         )
         svc_raw = input(
-            "Captcha solver service [groq/gemini/2captcha/capsolver, leave blank to skip]: "
+            "Captcha solver service [groq/gemini/browser/2captcha/capsolver, leave blank to skip]: "
         ).strip().lower()
         if svc_raw == "groq":
             solver_service = "groq"
@@ -3139,6 +3678,14 @@ def main() -> None:
             ).strip()
             if model_raw:
                 gemini_model = model_raw
+        elif svc_raw in ("browser", "manual"):
+            solver_service = "browser"
+            solver_key = ""  # no API key needed for browser solver
+            print(
+                "    Browser solver selected. If a captcha is required, a web server\n"
+                f"    will start on port {_CAPTCHA_WEB_SERVER_PORT}. Open the Replit preview\n"
+                "    tab (or http://localhost:8080) and solve the captcha there.\n"
+            )
         elif svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
             solver_service = svc_raw
             solver_key = input(
