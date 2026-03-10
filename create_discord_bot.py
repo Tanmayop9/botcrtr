@@ -161,7 +161,7 @@ MAX_CAPTCHA_POLL_ATTEMPTS = 36
 MAX_CAPTCHA_ATTEMPTS = 2
 
 # ---------------------------------------------------------------------------
-# Own hCaptcha solver -- Groq-powered + Multibot-powered
+# Own hCaptcha solver -- Groq-powered + Gemini-powered (both free)
 # ---------------------------------------------------------------------------
 # hCaptcha public API endpoints
 _HCAPTCHA_API_JS_URL       = "https://hcaptcha.com/1/api.js"
@@ -169,11 +169,15 @@ _HCAPTCHA_SITE_CONFIG_URL  = "https://hcaptcha.com/checksiteconfig"
 _HCAPTCHA_GET_CHALLENGE_URL = "https://hcaptcha.com/getcaptcha"
 _HCAPTCHA_CHECK_URL        = "https://hcaptcha.com/checkcaptcha"
 
-# Multibot API base URL (https://multibot.in)
-_MULTIBOT_BASE_URL = "http://api.multibot.in"
-# Multibot polling: up to _MULTIBOT_POLL_ATTEMPTS * _MULTIBOT_POLL_INTERVAL s
-_MULTIBOT_POLL_ATTEMPTS = 30
-_MULTIBOT_POLL_INTERVAL = 2
+# Gemini free vision API (https://ai.google.dev/gemini-api/docs)
+# Get a free API key at: https://aistudio.google.com/apikey
+GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_FAST_MODEL    = "gemini-1.5-flash"
+_GEMINI_API_URL_TMPL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+    "/{model}:generateContent"
+)
+_GEMINI_RATE_LIMIT_RETRIES = 3
 
 # Llama 4 Maverick: 17 B params / 128 experts -- best Groq vision model
 GROQ_DEFAULT_MODEL = "llama-4-maverick-17b-128e-instruct"
@@ -1120,6 +1124,734 @@ def _groq_analyze_challenge(
         return f"(Groq analysis unavailable: {exc})"
 
 
+# ---------------------------------------------------------------------------
+# Own hCaptcha solver -- Gemini-powered (free REST API, no extra package)
+# ---------------------------------------------------------------------------
+
+def _gemini_image_part(data_url: str) -> dict:
+    """
+    Convert a base64 data-URL (``data:<mime>;base64,<data>``) into a Gemini
+    ``inline_data`` content part dict.  Falls back to ``image/jpeg`` when the
+    MIME type cannot be parsed.
+    """
+    if "," in data_url:
+        header, b64data = data_url.split(",", 1)
+        mime = (
+            header.split(";")[0].split(":")[1]
+            if (":" in header and ";" in header)
+            else "image/jpeg"
+        )
+    else:
+        b64data = data_url
+        mime = "image/jpeg"
+    return {"inline_data": {"mime_type": mime, "data": b64data}}
+
+
+def _gemini_call_parts(
+    parts: list,
+    api_key: str,
+    model: str,
+    max_tokens: int = 10,
+) -> str:
+    """
+    Send a Gemini content *parts* list (text + inline_data items) to the
+    Gemini REST API and return the response text (stripped, lower-cased).
+
+    Uses the ``generateContent`` endpoint directly via ``requests`` -- no
+    additional package is required.  Retries automatically on HTTP 429
+    (rate limit) with exponential back-off up to ``_GEMINI_RATE_LIMIT_RETRIES``
+    attempts.  All other HTTP errors are re-raised as ``RuntimeError``.
+    """
+    url = _GEMINI_API_URL_TMPL.format(model=model)
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    for attempt in range(_GEMINI_RATE_LIMIT_RETRIES):
+        try:
+            resp = requests.post(
+                url,
+                params={"key": api_key},
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                if attempt < _GEMINI_RATE_LIMIT_RETRIES - 1:
+                    print(f"      Gemini rate-limited; retrying in {wait}s ...")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError("Gemini API rate limit exceeded after retries.")
+            if resp.status_code == 400:
+                raise RuntimeError(
+                    f"Gemini API rejected the request (HTTP 400): {resp.text[:200]}"
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                text = "".join(
+                    p.get("text", "")
+                    for p in candidates[0].get("content", {}).get("parts", [])
+                )
+                return text.strip().lower()
+            return ""
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Gemini API network error: {exc}") from exc
+    return ""
+
+
+def _gemini_classify_batch(
+    image_urls: list,
+    question: str,
+    api_key: str,
+    model: str,
+    img_session: requests.Session,
+    example_data_urls: "list | None" = None,
+) -> list:
+    """
+    Classify multiple images in a **single** Gemini API call.
+
+    Mirrors ``_groq_classify_batch`` but uses the Gemini REST API instead of
+    the Groq SDK.  All images are sent together in one ``contents[0].parts``
+    list so the model can compare them in context.
+
+    Returns a ``list[bool]`` in the same order as *image_urls*.  Falls back to
+    individual per-image calls when the batch request fails.
+    """
+    n = len(image_urls)
+    if n == 0:
+        return []
+    if n > _HCAPTCHA_BATCH_MAX:
+        results: list = []
+        for i in range(0, n, _HCAPTCHA_BATCH_MAX):
+            chunk = image_urls[i : i + _HCAPTCHA_BATCH_MAX]
+            results.extend(
+                _gemini_classify_batch(
+                    chunk, question, api_key, model, img_session, example_data_urls
+                )
+            )
+        return results
+
+    parts: list = []
+    if example_data_urls:
+        parts.append({"text": f"Reference example(s) showing '{question}':"})
+        for edu in example_data_urls:
+            parts.append(_gemini_image_part(edu))
+
+    parts.append({
+        "text": (
+            f"Below are {n} images, each labelled with a number.\n"
+            f"Task: {question}\n\n"
+            "Reply with ONLY the comma-separated numbers of images that match "
+            "the task (e.g. '1,3,5'), or the single word 'none' if none match. "
+            "Do not include any other text."
+        )
+    })
+
+    valid_indices: list = []
+    for i, url in enumerate(image_urls):
+        try:
+            du = _download_image_as_data_url(url, img_session)
+        except requests.RequestException as exc:
+            print(f"      Warning: could not download batch image {i + 1}: {exc}")
+            du = None
+        if du:
+            parts.append({"text": f"[Image {i + 1}]"})
+            parts.append(_gemini_image_part(du))
+            valid_indices.append(i)
+
+    if not valid_indices:
+        return [False] * n
+
+    try:
+        raw = _gemini_call_parts(parts, api_key, model, max_tokens=40)
+        results_flags = [False] * n
+        if raw and "none" not in raw:
+            for m in re.finditer(r'\b([0-9]+)\b', raw):
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < n:
+                    results_flags[idx] = True
+        return results_flags
+    except RuntimeError as exc:
+        print(f"      Warning: batch Gemini call failed ({exc}); falling back to per-image.")
+        per_image: list = []
+        for url in image_urls:
+            try:
+                du = _download_image_as_data_url(url, img_session)
+                p = [
+                    {"text": (
+                        f"{question}\n\n"
+                        "Reply with ONLY 'yes' if the image matches, or 'no' if it does not. "
+                        "Do not include any other text."
+                    )},
+                    _gemini_image_part(du),
+                ]
+                answer = _gemini_call_parts(p, api_key, model, max_tokens=5)
+                per_image.append(answer.startswith("y"))
+            except Exception:  # noqa: BLE001
+                per_image.append(False)
+        return per_image
+
+
+def _gemini_locate_entity(
+    image_url: str,
+    question: str,
+    entity_name: str,
+    api_key: str,
+    model: str,
+    img_session: requests.Session,
+) -> list:
+    """
+    Ask Gemini to locate one or more instances of the entity described in
+    *question* within the image at *image_url*.
+
+    Returns a list of ``{"entity_name": entity_name, "x": float, "y": float}``
+    dicts for use as the answer to an ``image_label_area_select`` task.
+    Coordinates are normalised to [0.0, 1.0].  Falls back to centre on errors.
+    """
+    label = entity_name or "target"
+    _fallback = [{"entity_name": label, "x": 0.5, "y": 0.5}]
+    try:
+        data_url = _download_image_as_data_url(image_url, img_session)
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return _fallback
+
+    prompt = (
+        f"Locate all instances of the following in the image: {question}\n\n"
+        "For EACH instance found, output exactly one line in this format:\n"
+        "x=<value>,y=<value>\n"
+        "where x and y are decimal numbers between 0.0 and 1.0 "
+        "(0.0,0.0 = top-left corner; 1.0,1.0 = bottom-right corner).\n"
+        "If nothing is found, output: x=0.5,y=0.5\n"
+        "Do not include any other text or explanation."
+    )
+    parts = [{"text": prompt}, _gemini_image_part(data_url)]
+    try:
+        raw = _gemini_call_parts(parts, api_key, model, max_tokens=80)
+    except RuntimeError as exc:
+        print(f"      Warning: Gemini locate-entity call failed: {exc}")
+        return _fallback
+
+    points: list = []
+    for line in raw.splitlines():
+        m = re.search(
+            r'x\s*=\s*([0-9]+\.?[0-9]*).*?y\s*=\s*([0-9]+\.?[0-9]*)',
+            line, re.IGNORECASE,
+        )
+        if m:
+            try:
+                x = max(0.0, min(1.0, float(m.group(1))))
+                y = max(0.0, min(1.0, float(m.group(2))))
+                points.append({"entity_name": label, "x": x, "y": y})
+            except ValueError:
+                continue
+    return points if points else _fallback
+
+
+def _gemini_read_text_image(
+    image_url: str,
+    question: str,
+    api_key: str,
+    model: str,
+    img_session: requests.Session,
+) -> str:
+    """
+    Ask Gemini to read or identify text in *image_url* relevant to *question*.
+    Used for ``image_label_text`` hCaptcha challenges.
+    Returns the extracted text (stripped) or an empty string on failure.
+    """
+    try:
+        data_url = _download_image_as_data_url(image_url, img_session)
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return ""
+
+    prompt = (
+        f"Task: {question}\n\n"
+        "Look at the image and transcribe only the text or characters that "
+        "match the task description above. "
+        "Reply with ONLY that text, exactly as it appears. "
+        "Do not add any explanation or punctuation beyond what is shown."
+    )
+    parts = [{"text": prompt}, _gemini_image_part(data_url)]
+    try:
+        raw = _gemini_call_parts(parts, api_key, model, max_tokens=60)
+        return raw.strip()
+    except RuntimeError as exc:
+        print(f"      Warning: Gemini read-text call failed: {exc}")
+        return ""
+
+
+def _gemini_solve_drag_drop(
+    image_url: str,
+    question: str,
+    api_key: str,
+    model: str,
+    img_session: requests.Session,
+) -> list:
+    """
+    Ask Gemini to solve an ``image_drag_drop`` hCaptcha task.
+
+    Returns a list of dicts ``{"start": {"x": float, "y": float},
+    "end": {"x": float, "y": float}}`` with coordinates normalised to
+    [0.0, 1.0].  Falls back to a centre-to-centre path on errors.
+    """
+    _fallback = [{"start": {"x": 0.25, "y": 0.5}, "end": {"x": 0.75, "y": 0.5}}]
+    try:
+        data_url = _download_image_as_data_url(image_url, img_session)
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return _fallback
+
+    prompt = (
+        f"Task: {question}\n\n"
+        "This is a drag-and-drop CAPTCHA image.  Identify every drag path "
+        "needed to solve the task.\n"
+        "For EACH path, output exactly one line in this format:\n"
+        "sx=<value>,sy=<value>->ex=<value>,ey=<value>\n"
+        "where sx/sy are the start x/y and ex/ey are the end x/y.\n"
+        "All values are decimal numbers between 0.0 and 1.0 "
+        "(0.0,0.0 = top-left; 1.0,1.0 = bottom-right).\n"
+        "If you cannot determine the path, output: sx=0.25,sy=0.5->ex=0.75,ey=0.5\n"
+        "Do not include any other text or explanation."
+    )
+    parts = [{"text": prompt}, _gemini_image_part(data_url)]
+    try:
+        raw = _gemini_call_parts(parts, api_key, model, max_tokens=120)
+    except RuntimeError as exc:
+        print(f"      Warning: Gemini drag-drop call failed: {exc}")
+        return _fallback
+
+    paths: list = []
+    for line in raw.splitlines():
+        m = re.search(
+            r'sx\s*=\s*([0-9.]+).*?sy\s*=\s*([0-9.]+).*?'
+            r'ex\s*=\s*([0-9.]+).*?ey\s*=\s*([0-9.]+)',
+            line, re.IGNORECASE,
+        )
+        if m:
+            try:
+                sx = max(0.0, min(1.0, float(m.group(1))))
+                sy = max(0.0, min(1.0, float(m.group(2))))
+                ex = max(0.0, min(1.0, float(m.group(3))))
+                ey = max(0.0, min(1.0, float(m.group(4))))
+                paths.append({"start": {"x": sx, "y": sy}, "end": {"x": ex, "y": ey}})
+            except ValueError:
+                continue
+    return paths if paths else _fallback
+
+
+def _gemini_solve_text_challenge(
+    question: str,
+    challenge: dict,
+    api_key: str,
+    model: str,
+) -> str:
+    """
+    Ask Gemini to answer a text-only hCaptcha challenge (no images).
+    Used for ``text_free_entry``, ``text_multiple_choice_*``, and
+    ``text_label_multiple_span_select`` challenge types.
+    Returns the plain-text answer chosen by the model.
+    """
+    req_type: str = challenge.get("request_type", "")
+    restricted: dict = challenge.get("requester_restricted_answer_set", {}) or {}
+
+    type_hint = _HCAPTCHA_KNOWN_CHALLENGE_TYPES.get(req_type, "")
+    choices_block = ""
+    if restricted:
+        choice_list = "\n".join(f"  - {k}: {v}" for k, v in restricted.items())
+        choices_block = f"\nAvailable answer options:\n{choice_list}\n"
+
+    prompt = (
+        f"You are answering an hCaptcha text challenge.\n"
+        f"Challenge type: {req_type}\n"
+        f"Description: {type_hint}\n\n"
+        f"Question: {question}\n"
+        f"{choices_block}\n"
+        "Reply with ONLY the answer text (or option key if options are listed). "
+        "Do not add explanation."
+    )
+    parts = [{"text": prompt}]
+    try:
+        return _gemini_call_parts(parts, api_key, model, max_tokens=60)
+    except RuntimeError as exc:
+        print(f"      Warning: Gemini text challenge call failed: {exc}")
+        return ""
+
+
+def _gemini_analyze_challenge(
+    challenge: dict,
+    api_key: str,
+    model: str,
+) -> str:
+    """
+    Use Gemini to explain an unknown or empty hCaptcha challenge.
+    Returns a plain-text analysis (up to 400 tokens).
+    Falls back to an informative string on any error.
+    """
+    safe: dict = {
+        "request_type":        challenge.get("request_type", ""),
+        "requester_question":  challenge.get("requester_question", {}),
+        "tasklist_length":     len(challenge.get("tasklist", [])),
+        "extra_keys":          [
+            k for k in challenge
+            if k not in {"tasklist", "request_type", "requester_question",
+                         "key", "c", "generated_pass_UUID"}
+        ],
+    }
+    known_types_block = "\n".join(
+        f"  • {k}: {v}" for k, v in _HCAPTCHA_KNOWN_CHALLENGE_TYPES.items()
+    )
+    prompt = (
+        "You are an expert in hCaptcha challenge analysis.\n\n"
+        "== Known hCaptcha request_type values ==\n"
+        f"{known_types_block}\n\n"
+        "== Received challenge (unknown / empty request_type) ==\n"
+        f"{json.dumps(safe, indent=2)}\n\n"
+        "Based on the known types above and the received challenge fields, please:\n"
+        "1. Identify which known type this challenge most likely maps to (or state 'unknown').\n"
+        "2. Explain what the challenge is asking the solver to do.\n"
+        "3. Suggest how to handle or solve it programmatically.\n\n"
+        "Be concise (3-6 sentences)."
+    )
+    parts = [{"text": prompt}]
+    try:
+        return _gemini_call_parts(parts, api_key, model, max_tokens=400)
+    except RuntimeError as exc:
+        return f"(Gemini analysis unavailable: {exc})"
+
+
+def _solve_hcaptcha_gemini(
+    sitekey: str,
+    pageurl: str,
+    rqdata: str,
+    gemini_api_key: str,
+    gemini_model: str = GEMINI_DEFAULT_MODEL,
+) -> str:
+    """
+    Solve an hCaptcha challenge using Google Gemini's free vision API.
+
+    No additional Python package is required -- all Gemini calls are made
+    directly via ``requests`` to the ``generateContent`` REST endpoint.
+
+    Get a free API key at: https://aistudio.google.com/apikey
+    Free-tier rate limits (as of 2025): 1 500 req/day, 15 RPM for Flash models.
+
+    Pipeline
+    --------
+    1. Fetch hCaptcha site config to obtain the proof-of-work descriptor and
+       the current JS bundle version.
+    2. Solve the PoW (``hsl`` / ``hsw`` / ``enterprise``) in pure Python.
+    3. POST to ``/getcaptcha`` with realistic mouse-movement motion data to
+       retrieve the image challenge.
+    4. Dispatch by challenge type using Gemini vision:
+       - ``image_label_binary`` / ``image_label_multiple_choice``
+             batch yes/no classification via ``_gemini_classify_batch``.
+       - ``image_label_area_select``
+             entity coordinates via ``_gemini_locate_entity``.
+       - ``image_label_text``
+             text transcription via ``_gemini_read_text_image``.
+       - ``image_drag_drop``
+             drag paths via ``_gemini_solve_drag_drop``.
+       - text-only types  (``text_free_entry``, ``text_multiple_choice_*``,
+             ``text_label_multiple_span_select``)
+             text answer via ``_gemini_solve_text_challenge``.
+       - Unknown type with images  -- best-effort binary batch.
+       - Unknown type without images -- Gemini explains then attempts empty
+             submission (may pass for enterprise / token-only challenges).
+    5. POST the labelled answers with motion data to ``/checkcaptcha``.
+    6. If answers are rejected, re-fetch a fresh challenge and retry up to
+       ``_HCAPTCHA_SOLVE_RETRIES`` additional times before raising.
+    7. Return the ``generated_pass_UUID`` token.
+
+    Raises ``RuntimeError`` on API key errors or when hCaptcha rejects the
+    submitted answers on all retry attempts.
+    """
+    host = urlparse(pageurl).hostname or "discord.com"
+    img_session = requests.Session()
+    img_session.headers.update({"User-Agent": _HCAPTCHA_HEADERS["User-Agent"]})
+
+    # -- 1. Site config -------------------------------------------------------
+    print(f"    [hCaptcha/Gemini] Fetching site config (model: {gemini_model}) ...")
+    version = _hcaptcha_get_version()
+    cfg_resp = requests.get(
+        _HCAPTCHA_SITE_CONFIG_URL,
+        params={"v": version, "host": host, "sitekey": sitekey, "sc": "1", "swa": "1"},
+        headers=_HCAPTCHA_HEADERS,
+        timeout=15,
+    )
+    cfg_resp.raise_for_status()
+    config = cfg_resp.json()
+    c_obj: dict = config.get("c") or {}
+
+    # -- 2. Proof-of-work -----------------------------------------------------
+    def _solve_pow(c: dict) -> str:
+        ptype = (c.get("type") or "").lower()
+        if ptype == "hsl":
+            sol = _hcaptcha_solve_hsl_pow(c.get("req", ""))
+            print("    [hCaptcha/Gemini] PoW (hsl) solved.")
+            return sol
+        if ptype in ("hsw", "enterprise"):
+            print("    [hCaptcha/Gemini] Solving hsw PoW ...")
+            sol = _hcaptcha_solve_hsw_pow(c.get("req", ""))
+            print("    [hCaptcha/Gemini] PoW (hsw) solved.")
+            return sol
+        return ""
+
+    pow_type_label = (c_obj.get("type") or "(none)").lower()
+    print(f"    [hCaptcha/Gemini] PoW type: {pow_type_label}")
+    pow_solution = _solve_pow(c_obj)
+
+    # -- Outer retry loop: re-fetch challenge if answers are rejected ----------
+    result: dict = {}
+    for solve_attempt in range(1 + _HCAPTCHA_SOLVE_RETRIES):
+        if solve_attempt > 0:
+            print(
+                f"    [hCaptcha/Gemini] Answers rejected; "
+                f"re-fetching challenge (attempt {solve_attempt + 1}) ..."
+            )
+            pow_solution = _solve_pow(c_obj)
+
+        # -- 3. Get challenge -------------------------------------------------
+        if solve_attempt == 0:
+            print("    [hCaptcha/Gemini] Fetching challenge ...")
+        ts_ms = int(time.time() * 1000)
+        motion_get = _generate_motion_data(ts_ms)
+        getcap_form: dict = {
+            "v":          version,
+            "host":       host,
+            "sitekey":    sitekey,
+            "sc":         "1",
+            "swa":        "1",
+            "motionData": json.dumps(motion_get),
+            "pdc":        json.dumps({"s": ts_ms, "n": 0, "p": 0, "gcs": 10}),
+            "n":          pow_solution,
+            "c":          json.dumps(c_obj),
+        }
+        if rqdata:
+            getcap_form["rqdata"] = rqdata
+
+        cap_resp = requests.post(
+            f"{_HCAPTCHA_GET_CHALLENGE_URL}/{sitekey}",
+            data=getcap_form,
+            headers=_HCAPTCHA_HEADERS,
+            timeout=20,
+        )
+        cap_resp.raise_for_status()
+        challenge: dict = cap_resp.json()
+
+        if challenge.get("generated_pass_UUID"):
+            print("    [hCaptcha/Gemini] Challenge passed automatically (no images).")
+            return challenge["generated_pass_UUID"]
+
+        req_type: str = challenge.get("request_type", "")
+        if not req_type and challenge.get("tasklist"):
+            req_type = "image_label_binary"
+
+        tasklist: list = challenge.get("tasklist", [])
+        question_dict: dict = challenge.get("requester_question", {})
+        question: str = (
+            question_dict.get("en")
+            or next(iter(question_dict.values()), "Does this image match?")
+        )
+        challenge_key: str = challenge.get("key", "")
+        c_next: dict = challenge.get("c") or c_obj
+
+        # Collect reference example images
+        example_data_urls: list = []
+        for ex in challenge.get("requester_question_example", []):
+            ex_url = ex if isinstance(ex, str) else (ex.get("datapoint_uri") or "")
+            if ex_url:
+                try:
+                    example_data_urls.append(
+                        _download_image_as_data_url(ex_url, img_session)
+                    )
+                except requests.RequestException as exc:
+                    print(f"      Warning: could not download example image: {exc}")
+
+        # -- 4. Build answers based on challenge type -------------------------
+        answers: dict = {}
+
+        if req_type in ("image_label_binary", "image_label_multiple_choice"):
+            type_label = (
+                "batch-classifying" if req_type == "image_label_binary"
+                else "multiple-choice"
+            )
+            print(
+                f'    [hCaptcha/Gemini] {type_label.capitalize()} '
+                f'{len(tasklist)} image(s) [{req_type}]: "{question}" ...'
+            )
+            task_keys: list = []
+            image_urls: list = []
+            for task in tasklist:
+                tk: str = task.get("task_key") or task.get("datapoint_hash", "")
+                iu: str = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                if tk and iu:
+                    task_keys.append(tk)
+                    image_urls.append(iu)
+            batch_results = _gemini_classify_batch(
+                image_urls, question, gemini_api_key, gemini_model, img_session,
+                example_data_urls=example_data_urls or None,
+            )
+            for tk, matched in zip(task_keys, batch_results):
+                answers[tk] = "true" if matched else "false"
+                print(f"      Task {tk[:10]}... -> {'yes' if matched else 'no'}")
+
+        elif req_type == "image_label_area_select":
+            entity_m = re.search(
+                r'(?:click on|find|locate|select|identify)\s+'
+                r'(?:all\s+)?(?:the\s+)?([a-z0-9 ]+?)(?:\s*$|\.)',
+                question, re.IGNORECASE,
+            )
+            entity_name: str = entity_m.group(1).strip() if entity_m else "target"
+            print(
+                f'    [hCaptcha/Gemini] Locating "{entity_name}" in '
+                f'{len(tasklist)} image(s) [{req_type}]: "{question}" ...'
+            )
+            for task in tasklist:
+                tk = task.get("task_key") or task.get("datapoint_hash", "")
+                iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                if not tk or not iu:
+                    continue
+                coords = _gemini_locate_entity(
+                    iu, question, entity_name, gemini_api_key, gemini_model, img_session
+                )
+                answers[tk] = coords
+                print(f"      Task {tk[:10]}... -> {coords}")
+
+        elif req_type == "image_label_text":
+            print(
+                f'    [hCaptcha/Gemini] Text challenge {len(tasklist)} image(s)'
+                f' [{req_type}]: "{question}" ...'
+            )
+            for task in tasklist:
+                tk = task.get("task_key") or task.get("datapoint_hash", "")
+                iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                if not tk or not iu:
+                    continue
+                text = _gemini_read_text_image(
+                    iu, question, gemini_api_key, gemini_model, img_session
+                )
+                answers[tk] = text or ""
+                print(f"      Task {tk[:10]}... -> {text!r}")
+
+        elif req_type == "image_drag_drop":
+            print(
+                f'    [hCaptcha/Gemini] Drag-drop challenge {len(tasklist)} image(s)'
+                f' [{req_type}]: "{question}" ...'
+            )
+            for task in tasklist:
+                tk = task.get("task_key") or task.get("datapoint_hash", "")
+                iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                if not tk or not iu:
+                    continue
+                paths = _gemini_solve_drag_drop(
+                    iu, question, gemini_api_key, gemini_model, img_session
+                )
+                answers[tk] = paths
+                print(f"      Task {tk[:10]}... -> {paths}")
+
+        elif req_type in (
+            "text_free_entry",
+            "text_label_multiple_span_select",
+            "text_multiple_choice_one_option",
+            "text_multiple_choice_multiple_options",
+        ):
+            print(
+                f'    [hCaptcha/Gemini] Text-only challenge [{req_type}]: '
+                f'"{question}" ...'
+            )
+            answer_text = _gemini_solve_text_challenge(
+                question, challenge, gemini_api_key, gemini_model
+            )
+            print(f"      Gemini answer: {answer_text!r}")
+            answers = {"answer": answer_text}
+
+        else:
+            if not tasklist:
+                print(
+                    f"    [hCaptcha/Gemini] Unknown challenge type "
+                    f"'{req_type}' with no image tasks."
+                )
+                print("    [hCaptcha/Gemini] Asking Gemini to analyse the challenge ...")
+                explanation = _gemini_analyze_challenge(
+                    challenge, gemini_api_key, gemini_model
+                )
+                print(f"    [hCaptcha/Gemini] Gemini analysis:\n      {explanation}")
+                print(
+                    "    [hCaptcha/Gemini] Attempting submission with empty "
+                    "answers (no image tasks present) ..."
+                )
+                # answers stays {} -- fall through to step 5
+            else:
+                print(
+                    f'    [hCaptcha/Gemini] Unknown type "{req_type}" -- attempting '
+                    f'batch classification on {len(tasklist)} image(s): '
+                    f'"{question}" ...'
+                )
+                task_keys = []
+                image_urls = []
+                for task in tasklist:
+                    tk = task.get("task_key") or task.get("datapoint_hash", "")
+                    iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                    if tk and iu:
+                        task_keys.append(tk)
+                        image_urls.append(iu)
+                batch_results = _gemini_classify_batch(
+                    image_urls, question, gemini_api_key, gemini_model, img_session,
+                    example_data_urls=example_data_urls or None,
+                )
+                for tk, matched in zip(task_keys, batch_results):
+                    answers[tk] = "true" if matched else "false"
+                    print(f"      Task {tk[:10]}... -> {'yes' if matched else 'no'}")
+
+        # -- 5. Submit answers ------------------------------------------------
+        print("    [hCaptcha/Gemini] Submitting answers ...")
+        second_pow = _solve_pow(c_next) if isinstance(c_next, dict) else ""
+        ts_ms2 = int(time.time() * 1000)
+        motion_check = _generate_motion_data(ts_ms2)
+        submit_payload = {
+            "v":          version,
+            "job_mode":   req_type,
+            "answers":    answers,
+            "serverdomain": host,
+            "sitekey":    sitekey,
+            "n":          second_pow or pow_solution,
+            "c": (
+                json.dumps(c_next)
+                if isinstance(c_next, dict)
+                else (c_next or json.dumps(c_obj))
+            ),
+            "motionData": json.dumps(motion_check),
+        }
+        submit_resp = requests.post(
+            f"{_HCAPTCHA_CHECK_URL}/{sitekey}/{challenge_key}",
+            json=submit_payload,
+            headers={**_HCAPTCHA_HEADERS, "Content-Type": "application/json"},
+            timeout=20,
+        )
+        submit_resp.raise_for_status()
+        result = submit_resp.json()
+
+        token: str = result.get("generated_pass_UUID", "")
+        if token:
+            print("    [hCaptcha/Gemini] Challenge solved successfully.")
+            return token
+
+        # Answers were rejected; loop will retry if attempts remain.
+
+    raise RuntimeError(
+        f"hCaptcha: challenge not accepted after "
+        f"{1 + _HCAPTCHA_SOLVE_RETRIES} attempt(s) -- "
+        f"last response: {result}"
+    )
+
+
 def _solve_hcaptcha_groq(
     sitekey: str,
     pageurl: str,
@@ -1499,268 +2231,6 @@ def _solve_hcaptcha_groq(
     )
 
 
-def _multibot_solve_challenge(
-    api_key: str,
-    req_type: str,
-    tasklist: list,
-    requester_question: dict,
-    requester_question_example: list,
-) -> dict:
-    """
-    Submit an hCaptcha challenge to the Multibot API (multibot.in) and poll
-    for the solved answers.
-
-    Multibot's ``hCaptchaRequester`` task type accepts the raw challenge data
-    (request type, question, task list) and returns a dict of
-    ``task_key -> answer`` values ready to submit directly to hCaptcha's
-    ``/checkcaptcha`` endpoint.
-
-    Raises ``RuntimeError`` if the task fails, times out, or the API returns
-    an unexpected response.
-    """
-    task_payload: dict = {
-        "clientKey": api_key,
-        "type": "hCaptchaRequester",
-        "task": {
-            "request_type": req_type,
-            "requester_question": requester_question,
-            "requester_question_example": requester_question_example,
-            "tasklist": tasklist,
-        },
-    }
-    cr = requests.post(
-        f"{_MULTIBOT_BASE_URL}/createTask",
-        json=task_payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-    cr.raise_for_status()
-    cd: dict = cr.json()
-    if cd.get("errorId") not in (0, None):
-        raise RuntimeError(
-            f"Multibot createTask error (id={cd.get('errorId')}): "
-            f"{cd.get('errorDescription', cd)}"
-        )
-    task_id = cd.get("taskId")
-    if not task_id:
-        raise RuntimeError(
-            f"Multibot createTask returned no taskId: {cd}"
-        )
-
-    for _ in range(_MULTIBOT_POLL_ATTEMPTS):
-        time.sleep(_MULTIBOT_POLL_INTERVAL)
-        rr = requests.post(
-            f"{_MULTIBOT_BASE_URL}/getTaskResult",
-            json={"clientKey": api_key, "taskId": task_id},
-            headers={"Content-Type": "application/json"},
-            timeout=15,
-        )
-        rr.raise_for_status()
-        rd: dict = rr.json()
-        if rd.get("errorId") not in (0, None):
-            raise RuntimeError(
-                f"Multibot getTaskResult error (id={rd.get('errorId')}): "
-                f"{rd.get('errorDescription', rd)}"
-            )
-        status: str = rd.get("status", "")
-        if status == "ready":
-            answers = rd.get("answers")
-            if isinstance(answers, dict) and answers:
-                return answers
-            raise RuntimeError(
-                f"Multibot task ready but answers missing or empty: {rd}"
-            )
-        if status == "error":
-            raise RuntimeError(
-                f"Multibot task failed with error status: {rd}"
-            )
-        # status == "processing" -- keep polling
-
-    raise RuntimeError(
-        f"Multibot: timed out after {_MULTIBOT_POLL_ATTEMPTS * _MULTIBOT_POLL_INTERVAL}s "
-        "waiting for task result."
-    )
-
-
-def _solve_hcaptcha_multibot(
-    sitekey: str,
-    pageurl: str,
-    rqdata: str,
-    multibot_api_key: str,
-) -> str:
-    """
-    Solve an hCaptcha challenge using the Multibot API (multibot.in).
-
-    Pipeline
-    --------
-    1. Fetch hCaptcha site config to obtain the proof-of-work descriptor and
-       the current JS bundle version.
-    2. Solve the PoW (``hsl`` / ``hsw`` / ``enterprise``) in pure Python.
-    3. POST to ``/getcaptcha`` with realistic mouse-movement motion data to
-       retrieve the image challenge.
-    4. Send the raw challenge data (request type, question, task list) to the
-       Multibot ``hCaptchaRequester`` API and poll for solved answers.
-    5. POST the answers with motion data to ``/checkcaptcha``.
-    6. If answers are rejected, re-fetch a fresh challenge and retry up to
-       ``_HCAPTCHA_SOLVE_RETRIES`` additional times before raising.
-    7. Return the ``generated_pass_UUID`` token.
-
-    Raises ``RuntimeError`` when Multibot returns an error or hCaptcha
-    rejects the submitted answers on all retry attempts.
-    """
-    host = urlparse(pageurl).hostname or "discord.com"
-
-    # -- 1. Site config -------------------------------------------------------
-    print("    [hCaptcha/Multibot] Fetching site config ...")
-    version = _hcaptcha_get_version()
-    cfg_resp = requests.get(
-        _HCAPTCHA_SITE_CONFIG_URL,
-        params={"v": version, "host": host, "sitekey": sitekey, "sc": "1", "swa": "1"},
-        headers=_HCAPTCHA_HEADERS,
-        timeout=15,
-    )
-    cfg_resp.raise_for_status()
-    config = cfg_resp.json()
-    c_obj: dict = config.get("c") or {}
-
-    # -- 2. Proof-of-work -----------------------------------------------------
-    def _solve_pow(c: dict) -> str:
-        ptype = (c.get("type") or "").lower()
-        if ptype == "hsl":
-            sol = _hcaptcha_solve_hsl_pow(c.get("req", ""))
-            print("    [hCaptcha/Multibot] PoW (hsl) solved.")
-            return sol
-        if ptype in ("hsw", "enterprise"):
-            print("    [hCaptcha/Multibot] Solving hsw PoW ...")
-            sol = _hcaptcha_solve_hsw_pow(c.get("req", ""))
-            print("    [hCaptcha/Multibot] PoW (hsw) solved.")
-            return sol
-        return ""
-
-    pow_type_label = (c_obj.get("type") or "(none)").lower()
-    print(f"    [hCaptcha/Multibot] PoW type: {pow_type_label}")
-    pow_solution = _solve_pow(c_obj)
-
-    # -- Outer retry loop: re-fetch challenge if answers are rejected ----------
-    result: dict = {}
-    for solve_attempt in range(1 + _HCAPTCHA_SOLVE_RETRIES):
-        if solve_attempt > 0:
-            print(
-                f"    [hCaptcha/Multibot] Answers rejected; "
-                f"re-fetching challenge (attempt {solve_attempt + 1}) ..."
-            )
-            pow_solution = _solve_pow(c_obj)
-
-        # -- 3. Get challenge -------------------------------------------------
-        if solve_attempt == 0:
-            print("    [hCaptcha/Multibot] Fetching challenge ...")
-        ts_ms = int(time.time() * 1000)
-        motion_get = _generate_motion_data(ts_ms)
-        getcap_form: dict = {
-            "v":          version,
-            "host":       host,
-            "sitekey":    sitekey,
-            "sc":         "1",
-            "swa":        "1",
-            "motionData": json.dumps(motion_get),
-            "pdc":        json.dumps({"s": ts_ms, "n": 0, "p": 0, "gcs": 10}),
-            "n":          pow_solution,
-            "c":          json.dumps(c_obj),
-        }
-        if rqdata:
-            getcap_form["rqdata"] = rqdata
-
-        cap_resp = requests.post(
-            f"{_HCAPTCHA_GET_CHALLENGE_URL}/{sitekey}",
-            data=getcap_form,
-            headers=_HCAPTCHA_HEADERS,
-            timeout=20,
-        )
-        cap_resp.raise_for_status()
-        challenge: dict = cap_resp.json()
-
-        # Some easy challenges pass immediately without image tasks.
-        if challenge.get("generated_pass_UUID"):
-            print("    [hCaptcha/Multibot] Challenge passed automatically (no images).")
-            return challenge["generated_pass_UUID"]
-
-        req_type: str = challenge.get("request_type", "")
-        if not req_type and challenge.get("tasklist"):
-            req_type = "image_label_binary"
-
-        tasklist: list = challenge.get("tasklist", [])
-        challenge_key: str = challenge.get("key", "")
-        c_next: dict = challenge.get("c") or c_obj
-
-        if not tasklist:
-            continue
-
-        question_dict: dict = challenge.get("requester_question", {})
-        question_example: list = challenge.get("requester_question_example", [])
-
-        # -- 4. Solve via Multibot API ----------------------------------------
-        print(
-            f"    [hCaptcha/Multibot] Sending {len(tasklist)} task(s) "
-            f"[{req_type}] to Multibot ..."
-        )
-        try:
-            answers: dict = _multibot_solve_challenge(
-                api_key=multibot_api_key,
-                req_type=req_type,
-                tasklist=tasklist,
-                requester_question=question_dict,
-                requester_question_example=question_example,
-            )
-        except RuntimeError as exc:
-            print(f"    [hCaptcha/Multibot] Multibot error: {exc}")
-            continue
-
-        if not answers:
-            print("    [hCaptcha/Multibot] Multibot returned empty answers; retrying ...")
-            continue
-
-        # -- 5. Submit answers ------------------------------------------------
-        print("    [hCaptcha/Multibot] Submitting answers ...")
-        second_pow = _solve_pow(c_next) if isinstance(c_next, dict) else ""
-        ts_ms2 = int(time.time() * 1000)
-        motion_check = _generate_motion_data(ts_ms2)
-        submit_payload: dict = {
-            "v":          version,
-            "job_mode":   req_type,
-            "answers":    answers,
-            "serverdomain": host,
-            "sitekey":    sitekey,
-            "n":          second_pow or pow_solution,
-            "c": (
-                json.dumps(c_next)
-                if isinstance(c_next, dict)
-                else (c_next or json.dumps(c_obj))
-            ),
-            "motionData": json.dumps(motion_check),
-        }
-        submit_resp = requests.post(
-            f"{_HCAPTCHA_CHECK_URL}/{sitekey}/{challenge_key}",
-            json=submit_payload,
-            headers={**_HCAPTCHA_HEADERS, "Content-Type": "application/json"},
-            timeout=20,
-        )
-        submit_resp.raise_for_status()
-        result = submit_resp.json()
-
-        token: str = result.get("generated_pass_UUID", "")
-        if token:
-            print("    [hCaptcha/Multibot] Challenge solved successfully.")
-            return token
-
-        # Answers were rejected; loop will retry if attempts remain.
-
-    raise RuntimeError(
-        f"hCaptcha: challenge not accepted after "
-        f"{1 + _HCAPTCHA_SOLVE_RETRIES} attempt(s) -- "
-        f"last response: {result}"
-    )
-
-
 def _solve_hcaptcha(
     sitekey: str,
     pageurl: str,
@@ -1768,6 +2238,7 @@ def _solve_hcaptcha(
     solver_key: str,
     solver_service: str = "2captcha",
     groq_model: str = GROQ_DEFAULT_MODEL,
+    gemini_model: str = GEMINI_DEFAULT_MODEL,
 ) -> str:
     """
     Solve an hCaptcha challenge and return the response token.
@@ -1778,11 +2249,11 @@ def _solve_hcaptcha(
                             Llama 4 Maverick vision (recommended, free tier).
                             *solver_key* must be a Groq API key.
                             Install: pip install groq>=1.1.0
-    "multibot"           -- Delegate image analysis to Multibot API
-                            (multibot.in).  PoW and challenge fetch are
-                            handled locally; only the image-classification
-                            step is offloaded.  *solver_key* must be a
-                            Multibot API key.  Get one at multibot.in
+                            Free key: https://console.groq.com
+    "gemini"             -- Built-in Google Gemini vision solver using the
+                            free Gemini REST API (no extra package needed).
+                            *solver_key* must be a Gemini API key.
+                            Free key: https://aistudio.google.com/apikey
     "2captcha" / "2cap"  -- Delegate to https://2captcha.com (paid).
     "capsolver" / "cap"  -- Delegate to https://capsolver.com (paid).
 
@@ -1800,12 +2271,13 @@ def _solve_hcaptcha(
             groq_model=groq_model,
         )
 
-    if svc == "multibot":
-        return _solve_hcaptcha_multibot(
+    if svc == "gemini":
+        return _solve_hcaptcha_gemini(
             sitekey=sitekey,
             pageurl=pageurl,
             rqdata=rqdata,
-            multibot_api_key=solver_key,
+            gemini_api_key=solver_key,
+            gemini_model=gemini_model,
         )
 
     if svc in ("2captcha", "2cap"):
@@ -1885,7 +2357,7 @@ def _solve_hcaptcha(
 
     raise RuntimeError(
         f"Unknown captcha solver service: {solver_service!r}. "
-        "Use 'groq', 'multibot', '2captcha', or 'capsolver'."
+        "Use 'groq', 'gemini', '2captcha', or 'capsolver'."
     )
 
 
@@ -1895,6 +2367,7 @@ def api_create_application(
     solver_key: str = "",
     solver_service: str = "2captcha",
     groq_model: str = GROQ_DEFAULT_MODEL,
+    gemini_model: str = GEMINI_DEFAULT_MODEL,
 ) -> dict:
     """POST /api/v10/applications -- create app, return application object.
 
@@ -1916,7 +2389,7 @@ def api_create_application(
                     raise RuntimeError(
                         f"create application: HTTP {resp.status_code} -- {body}\n"
                         "  Discord requires a captcha solution.  Re-run the script\n"
-                        "  and supply a captcha solver API key (groq, multibot,\n"
+                        "  and supply a captcha solver API key (groq, gemini,\n"
                         "  2captcha, or capsolver) when prompted, or use Method 2\n"
                         "  (Browser) instead."
                     )
@@ -1933,6 +2406,7 @@ def api_create_application(
                     solver_key=solver_key,
                     solver_service=solver_service,
                     groq_model=groq_model,
+                    gemini_model=gemini_model,
                 )
                 payload = {"name": name, "captcha_key": captcha_token}
                 if body.get("captcha_rqtoken"):
@@ -2042,9 +2516,10 @@ def run_api_bot(
     solver_key: str = "",
     solver_service: str = "2captcha",
     groq_model: str = GROQ_DEFAULT_MODEL,
+    gemini_model: str = GEMINI_DEFAULT_MODEL,
 ) -> str:
     """Run the full API creation flow for one bot. Returns the token."""
-    app    = api_create_application(sess, bot_name, solver_key, solver_service, groq_model)
+    app    = api_create_application(sess, bot_name, solver_key, solver_service, groq_model, gemini_model)
     app_id = app["id"]
     api_create_bot_user(sess, app_id)
     token  = api_reset_bot_token(sess, app_id, totp_secret)
@@ -2508,6 +2983,7 @@ def main() -> None:
     solver_key = ""
     solver_service = "groq"     # default to the built-in free solver
     groq_model = GROQ_DEFAULT_MODEL
+    gemini_model = GEMINI_DEFAULT_MODEL
     if method == "api":
         groq_note = (
             " [RECOMMENDED, free]" if GROQ_AVAILABLE
@@ -2519,17 +2995,18 @@ def main() -> None:
             f"  groq{groq_note}\n"
             "      Built-in Llama 4 vision solver via Groq API.\n"
             "      Free API key: https://console.groq.com\n"
-            "  multibot  -- Multibot AI solver (multibot.in).\n"
-            "      Offloads image analysis to Multibot; PoW handled locally.\n"
-            "      API key required: https://multibot.in\n"
+            "  gemini  [free]\n"
+            "      Built-in Google Gemini vision solver (REST API, no extra package).\n"
+            "      Free API key: https://aistudio.google.com/apikey\n"
+            "      Free tier: 1 500 req/day, 15 RPM for Flash models.\n"
             "  2captcha  -- paid service: https://2captcha.com\n"
             "  capsolver -- paid service: https://capsolver.com\n"
             "  Leave blank to skip (an error will appear if a captcha is triggered).\n"
         )
         svc_raw = input(
-            "Captcha solver service [groq/multibot/2captcha/capsolver, leave blank to skip]: "
+            "Captcha solver service [groq/gemini/2captcha/capsolver, leave blank to skip]: "
         ).strip().lower()
-        if svc_raw in ("groq",):
+        if svc_raw == "groq":
             solver_service = "groq"
             solver_key = input(
                 "Groq API key (get one free at console.groq.com): "
@@ -2540,11 +3017,17 @@ def main() -> None:
             ).strip()
             if model_raw:
                 groq_model = model_raw
-        elif svc_raw == "multibot":
-            solver_service = "multibot"
+        elif svc_raw == "gemini":
+            solver_service = "gemini"
             solver_key = input(
-                "Multibot API key (get one at multibot.in): "
+                "Gemini API key (get one free at aistudio.google.com/apikey): "
             ).strip()
+            model_raw = input(
+                f"Gemini model [ENTER for default '{GEMINI_DEFAULT_MODEL}',\n"
+                f"  or type '{GEMINI_FAST_MODEL}' for older Flash model]: "
+            ).strip()
+            if model_raw:
+                gemini_model = model_raw
         elif svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
             solver_service = svc_raw
             solver_key = input(
@@ -2587,7 +3070,7 @@ def main() -> None:
                 if method == "api":
                     run_api_bot(
                         sess, bot_name, totp_secret, guild_id, permissions,
-                        solver_key, solver_service, groq_model,
+                        solver_key, solver_service, groq_model, gemini_model,
                     )
                 else:
                     run_browser_bot(driver, bot_name, totp_secret, guild_id, permissions)
