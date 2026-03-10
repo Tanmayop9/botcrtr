@@ -1,5 +1,8 @@
 requests>=2.28.0,<3.0.0
 pyotp>=2.9.0,<3.0.0
+# groq is needed for the built-in Groq-powered hCaptcha solver (Method 1).
+# Get a free API key at https://console.groq.com
+groq>=1.1.0,<2.0.0
 # Selenium is needed for Method 2 (Browser).
 # On Termux install Firefox + geckodriver first: run termux_setup.sh
 selenium>=4.0.0,<5.0.0
