@@ -22,7 +22,10 @@ Supports two automation methods -- user picks at runtime:
                       Get a free API key: https://console.groq.com
                       Default model : meta-llama/llama-4-maverick-17b-128e-instruct
                       Fast  model   : meta-llama/llama-4-scout-17b-16e-instruct
-                      Supports hCaptcha challenges with hsl- and hsw-type proof-of-work.
+                      Supports challenge types: image_label_binary,
+                      image_label_area_select, image_label_multiple_choice,
+                      and unknown types with image tasks (best-effort).
+                      Supports hsl- and hsw-type proof-of-work.
                       hsw requires Node.js (pkg install nodejs on Termux).
 
         "2captcha" -- Delegate to 2captcha.com (paid service).
@@ -436,6 +439,87 @@ def _hcaptcha_solve_hsw_pow(req: str) -> str:
     return solution
 
 
+def _groq_call_vision(
+    data_url: str,
+    prompt: str,
+    groq_client: "GroqClient",
+    model: str,
+    max_tokens: int = 5,
+) -> str:
+    """
+    Send *data_url* (base64 image) + *prompt* to Groq's vision model and return
+    the raw text response (stripped, lower-cased).
+
+    Retries automatically on ``GroqRateLimitError`` with exponential back-off
+    (up to ``_GROQ_RATE_LIMIT_RETRIES`` attempts).  All other Groq errors are
+    re-raised as ``RuntimeError``.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
+        try:
+            completion = groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+            return (completion.choices[0].message.content or "").strip().lower()
+
+        except GroqRateLimitError:
+            wait = 2 ** (attempt + 1)
+            if attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
+                print(f"      Groq rate-limited; retrying in {wait}s ...")
+                time.sleep(wait)
+            else:
+                raise
+
+        except GroqAuthError as exc:
+            raise RuntimeError(
+                f"Groq authentication failed -- check your API key: {exc}"
+            ) from exc
+
+        except (GroqConnectionError, GroqTimeoutError) as exc:
+            raise RuntimeError(
+                f"Groq network error: {exc}"
+            ) from exc
+
+        except GroqBadRequestError as exc:
+            raise RuntimeError(
+                f"Groq rejected the vision request: {exc}"
+            ) from exc
+
+        except GroqAPIStatusError as exc:
+            raise RuntimeError(
+                f"Groq API error (HTTP {exc.status_code}): {exc.message}"
+            ) from exc
+
+    # Should not be reached.
+    return ""
+
+
+def _download_image_as_data_url(
+    image_url: str,
+    img_session: requests.Session,
+) -> str:
+    """
+    Download the image at *image_url* and return a base64 data-URL string.
+    Raises ``RuntimeError`` on failure.
+    """
+    img_resp = img_session.get(image_url, timeout=15)
+    img_resp.raise_for_status()
+    b64_data = base64.b64encode(img_resp.content).decode()
+    mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+    return f"data:{mime};base64,{b64_data}"
+
+
 def _groq_classify_image(
     image_url: str,
     question: str,
@@ -453,82 +537,69 @@ def _groq_classify_image(
     Automatically retries on ``GroqRateLimitError`` with exponential back-off
     (up to ``_GROQ_RATE_LIMIT_RETRIES`` attempts).
     """
-    # --- download & encode image -----------------------------------------
     try:
-        img_resp = img_session.get(image_url, timeout=15)
-        img_resp.raise_for_status()
-        b64_data = base64.b64encode(img_resp.content).decode()
-        mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-        data_url = f"data:{mime};base64,{b64_data}"
+        data_url = _download_image_as_data_url(image_url, img_session)
     except Exception as exc:  # noqa: BLE001
         print(f"      Warning: could not download image {image_url}: {exc}")
         return False
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"{question}\n\n"
-                        "Reply with ONLY the single word 'yes' if the image "
-                        "contains it, or 'no' if it does not. "
-                        "Do not include any other text."
-                    ),
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                },
-            ],
-        }
-    ]
+    prompt = (
+        f"{question}\n\n"
+        "Reply with ONLY the single word 'yes' if the image "
+        "contains it, or 'no' if it does not. "
+        "Do not include any other text."
+    )
+    answer = _groq_call_vision(data_url, prompt, groq_client, model, max_tokens=5)
+    return answer.startswith("y")
 
-    # --- call Groq SDK with retry on rate-limit --------------------------
-    for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
+
+def _groq_locate_entity(
+    image_url: str,
+    question: str,
+    groq_client: "GroqClient",
+    model: str,
+    img_session: requests.Session,
+) -> list:
+    """
+    Ask Groq's vision model to locate the entity described in *question* inside
+    the image at *image_url*.
+
+    Returns a list of ``{"entity_name": int, "x": float, "y": float}`` dicts
+    for use as the answer to an ``image_label_area_select`` hCaptcha task.
+    Coordinates are normalised to [0.0, 1.0] (0,0 = top-left, 1,1 = bottom-right).
+    Falls back to the image centre (0.5, 0.5) on parse or network errors so that
+    the pipeline can continue rather than abort.
+
+    Automatically retries on ``GroqRateLimitError`` with exponential back-off.
+    """
+    _fallback = [{"entity_name": 0, "x": 0.5, "y": 0.5}]  # entity_name=0: first (only) entity
+    try:
+        data_url = _download_image_as_data_url(image_url, img_session)
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return _fallback
+
+    prompt = (
+        f"Locate the following in the image: {question}\n\n"
+        "Reply with ONLY a single line in this exact format:\n"
+        "x=<value>,y=<value>\n"
+        "where x and y are decimal numbers between 0.0 and 1.0 representing "
+        "the normalised position (0,0 = top-left, 1,1 = bottom-right) of the "
+        "centre of the target object. Do not include any other text."
+    )
+    raw = _groq_call_vision(data_url, prompt, groq_client, model, max_tokens=20)
+    m = re.search(
+        r'x\s*=\s*([0-9]+\.?[0-9]*).*?y\s*=\s*([0-9]+\.?[0-9]*)',
+        raw, re.IGNORECASE,
+    )
+    if m:
         try:
-            completion = groq_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=5,
-                temperature=0.0,
-            )
-            answer = (
-                completion.choices[0].message.content or ""
-            ).strip().lower()
-            return answer.startswith("y")
-
-        except GroqRateLimitError:
-            wait = 2 ** (attempt + 1)          # 2 s, 4 s, 8 s
-            if attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
-                print(f"      Groq rate-limited; retrying in {wait}s ...")
-                time.sleep(wait)
-            else:
-                raise
-
-        except GroqAuthError as exc:
-            raise RuntimeError(
-                f"Groq authentication failed -- check your API key: {exc}"
-            ) from exc
-
-        except (GroqConnectionError, GroqTimeoutError) as exc:
-            raise RuntimeError(
-                f"Groq network error while classifying image: {exc}"
-            ) from exc
-
-        except GroqBadRequestError as exc:
-            raise RuntimeError(
-                f"Groq rejected the image classification request: {exc}"
-            ) from exc
-
-        except GroqAPIStatusError as exc:
-            raise RuntimeError(
-                f"Groq API error (HTTP {exc.status_code}): {exc.message}"
-            ) from exc
-
-    # Should not be reached; satisfies type checkers.
-    return False
+            x = max(0.0, min(1.0, float(m.group(1))))
+            y = max(0.0, min(1.0, float(m.group(2))))
+            return [{"entity_name": 0, "x": x, "y": y}]
+        except ValueError:
+            pass
+    return _fallback
 
 
 def _solve_hcaptcha_groq(
@@ -561,7 +632,7 @@ def _solve_hcaptcha_groq(
     - The ``groq`` package is not installed.
     - The Groq API key is invalid.
     - The hCaptcha PoW type is ``hsw``/``enterprise`` and ``node`` is not on PATH.
-    - The challenge type is not ``image_label_binary``.
+    - hCaptcha returns an unrecognised challenge type with no image tasks.
     - hCaptcha rejects the submitted answers.
     """
     if not GROQ_AVAILABLE:
@@ -637,17 +708,11 @@ def _solve_hcaptcha_groq(
 
     req_type: str = challenge.get("request_type", "")
     # Some hCaptcha responses omit 'request_type' even when a binary image
-    # tasklist is present.  Fall back to 'image_label_binary' so that the
-    # solver can proceed instead of aborting with a confusing empty-type error.
+    # tasklist is present.  Fall back to 'image_label_binary' so the solver
+    # can proceed rather than aborting with a confusing empty-type error.
     if not req_type and challenge.get("tasklist"):
         req_type = "image_label_binary"
-    if req_type != "image_label_binary":
-        raise RuntimeError(
-            f"hCaptcha: unsupported challenge type '{req_type}'. "
-            "Only 'image_label_binary' is supported by the built-in Groq solver."
-        )
 
-    # -- 4. Classify images with Groq SDK ------------------------------------
     tasklist: list = challenge.get("tasklist", [])
     question_dict: dict = challenge.get("requester_question", {})
     question: str = (
@@ -657,20 +722,83 @@ def _solve_hcaptcha_groq(
     challenge_key: str = challenge.get("key", "")
     c_next: dict = challenge.get("c") or c_obj
 
-    print(
-        f'    [hCaptcha/Groq] Classifying {len(tasklist)} image(s): "{question}" ...'
-    )
+    # -- 4. Build answers based on challenge type ----------------------------
     answers: dict = {}
-    for task in tasklist:
-        task_key: str = task.get("task_key") or task.get("datapoint_hash", "")
-        image_url: str = task.get("datapoint_uri") or task.get("datapoint_url", "")
-        if not task_key or not image_url:
-            continue
-        matched = _groq_classify_image(
-            image_url, question, groq_client, groq_model, img_session
+
+    if req_type == "image_label_binary":
+        # Binary: yes/no per image.
+        print(
+            f'    [hCaptcha/Groq] Classifying {len(tasklist)} image(s)'
+            f' [{req_type}]: "{question}" ...'
         )
-        answers[task_key] = "true" if matched else "false"
-        print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
+        for task in tasklist:
+            task_key: str = task.get("task_key") or task.get("datapoint_hash", "")
+            image_url: str = task.get("datapoint_uri") or task.get("datapoint_url", "")
+            if not task_key or not image_url:
+                continue
+            matched = _groq_classify_image(
+                image_url, question, groq_client, groq_model, img_session
+            )
+            answers[task_key] = "true" if matched else "false"
+            print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
+
+    elif req_type == "image_label_area_select":
+        # Area-select: return x,y coordinates (normalised 0.0-1.0) for each image.
+        print(
+            f'    [hCaptcha/Groq] Locating entities in {len(tasklist)} image(s)'
+            f' [{req_type}]: "{question}" ...'
+        )
+        for task in tasklist:
+            task_key = task.get("task_key") or task.get("datapoint_hash", "")
+            image_url = task.get("datapoint_uri") or task.get("datapoint_url", "")
+            if not task_key or not image_url:
+                continue
+            coords = _groq_locate_entity(
+                image_url, question, groq_client, groq_model, img_session
+            )
+            answers[task_key] = coords
+            print(f"      Task {task_key[:10]}... -> {coords}")
+
+    elif req_type == "image_label_multiple_choice":
+        # Multiple-choice: classify each candidate image as matching or not.
+        # The answer format mirrors binary (true/false per task key).
+        print(
+            f'    [hCaptcha/Groq] Multiple-choice {len(tasklist)} image(s)'
+            f' [{req_type}]: "{question}" ...'
+        )
+        for task in tasklist:
+            task_key = task.get("task_key") or task.get("datapoint_hash", "")
+            image_url = task.get("datapoint_uri") or task.get("datapoint_url", "")
+            if not task_key or not image_url:
+                continue
+            matched = _groq_classify_image(
+                image_url, question, groq_client, groq_model, img_session
+            )
+            answers[task_key] = "true" if matched else "false"
+            print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
+
+    else:
+        # Best-effort for any other type: treat images as binary classification
+        # when a tasklist is present; otherwise raise.
+        if not tasklist:
+            raise RuntimeError(
+                f"hCaptcha: unsupported challenge type '{req_type}' "
+                "with no image tasks -- cannot solve automatically."
+            )
+        print(
+            f'    [hCaptcha/Groq] Unknown type "{req_type}" -- attempting binary '
+            f'classification on {len(tasklist)} image(s): "{question}" ...'
+        )
+        for task in tasklist:
+            task_key = task.get("task_key") or task.get("datapoint_hash", "")
+            image_url = task.get("datapoint_uri") or task.get("datapoint_url", "")
+            if not task_key or not image_url:
+                continue
+            matched = _groq_classify_image(
+                image_url, question, groq_client, groq_model, img_session
+            )
+            answers[task_key] = "true" if matched else "false"
+            print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
 
     # -- 5. Submit answers ----------------------------------------------------
     print("    [hCaptcha/Groq] Submitting answers ...")
