@@ -3,8 +3,9 @@
 #  termux_setup.sh -- EDUCATIONAL PURPOSES ONLY
 #  One-shot setup for Discord Bot Creator on Termux (Android).
 #
-#  No browser or driver is needed -- the script uses the Discord
-#  REST API directly via Python requests.
+#  On Termux use Method 1 (API) when prompted -- no browser is
+#  available via pkg so Method 2 (Browser/Selenium) will not work.
+#  Only `requests` and `pyotp` are installed here (no selenium).
 # =============================================================
 set -euo pipefail
 
@@ -27,22 +28,25 @@ pkg install -y python || {
     exit 1
 }
 
-# --- 3. Install Python dependencies ---
+# --- 3. Install Python dependencies (API method only) ---
 echo ""
 echo "[3/3] Installing Python dependencies (requests + pyotp) ..."
 python -m ensurepip --upgrade 2>/dev/null || true
 pip install --upgrade pip || { echo "WARN: pip upgrade failed; continuing."; true; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-pip install -r "$SCRIPT_DIR/requirements.txt" || {
+# Install only the API-method deps; skip selenium/webdriver-manager (no browser on Termux)
+pip install "requests>=2.28.0,<3.0.0" "pyotp>=2.9.0,<3.0.0" || {
     echo "ERROR: Failed to install Python dependencies."
-    echo "       Check that requirements.txt exists at: $SCRIPT_DIR"
     exit 1
 }
 
 echo ""
 echo "================================================="
-echo "  Setup complete! No browser install needed."
+echo "  Setup complete!"
 echo "  Run the bot creator with:"
 echo "    python $SCRIPT_DIR/create_discord_bot.py"
+echo ""
+echo "  When prompted, select Method 1 (API) --"
+echo "  Method 2 (Browser) does not work on Termux."
 echo "================================================="
