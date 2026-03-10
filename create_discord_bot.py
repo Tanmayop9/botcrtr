@@ -820,6 +820,59 @@ def _groq_read_text_image(
     return _groq_call_vision(data_url, prompt, groq_client, model, max_tokens=60)
 
 
+def _groq_analyze_challenge(
+    challenge: dict,
+    groq_client: "GroqClient",
+    model: str,
+) -> str:
+    """
+    Use Groq to explain an unknown or empty hCaptcha challenge.
+
+    Sends the raw challenge JSON (fields: request_type, requester_question,
+    tasklist length, and any extra top-level keys) to Groq as a text prompt and
+    asks it to:
+      1. Identify what type of challenge this appears to be.
+      2. Explain what the challenge is asking the solver to do.
+      3. Suggest how to handle / solve it programmatically.
+
+    Returns the plain-text explanation from Groq (may be up to 300 tokens).
+    Falls back to an empty string on any error so callers are not blocked.
+    """
+    safe: dict = {
+        "request_type":        challenge.get("request_type", ""),
+        "requester_question":  challenge.get("requester_question", {}),
+        "tasklist_length":     len(challenge.get("tasklist", [])),
+        "extra_keys":          [
+            k for k in challenge
+            if k not in {"tasklist", "request_type", "requester_question",
+                         "key", "c", "generated_pass_UUID"}
+        ],
+    }
+    prompt = (
+        "You are an expert in hCaptcha challenge analysis.\n\n"
+        "I received the following hCaptcha challenge response with an unknown or "
+        "empty request_type and no image tasks:\n\n"
+        f"{json.dumps(safe, indent=2)}\n\n"
+        "Please:\n"
+        "1. Identify what type of challenge this appears to be.\n"
+        "2. Explain what the challenge is asking the solver to do.\n"
+        "3. Suggest how to handle or solve it programmatically.\n\n"
+        "Be concise (3-5 sentences)."
+    )
+    content = [{"type": "text", "text": prompt}]
+    messages = [{"role": "user", "content": content}]
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=300,
+            temperature=0.2,
+        )
+        return (completion.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001 -- never block the main flow
+        return f"(Groq analysis unavailable: {exc})"
+
+
 def _solve_hcaptcha_groq(
     sitekey: str,
     pageurl: str,
@@ -851,6 +904,10 @@ def _solve_hcaptcha_groq(
        - ``image_label_multiple_choice`` -- batch yes/no per candidate.
        - ``image_label_text``          -- read / transcribe text per image.
        - unknown types with images     -- best-effort binary batch.
+       - unknown types with no images  -- Groq analyses the challenge and
+                                          attempts submission with empty
+                                          answers (may pass for token /
+                                          enterprise-only challenges).
     5. POST the labelled answers with realistic motion data to
        ``/checkcaptcha``.
     6. If answers are rejected, re-fetch a fresh challenge and retry up to
@@ -860,7 +917,6 @@ def _solve_hcaptcha_groq(
     Raises ``RuntimeError`` when:
     - The ``groq`` package is not installed.
     - The Groq API key is invalid.
-    - hCaptcha returns an unrecognised challenge type with no image tasks.
     - hCaptcha rejects the submitted answers on all retry attempts.
     """
     if not GROQ_AVAILABLE:
@@ -1052,32 +1108,50 @@ def _solve_hcaptcha_groq(
 
         else:
             # Best-effort for any other type: treat as binary batch when images
-            # are present; raise a clear error otherwise.
+            # are present; use Groq to explain the challenge and attempt an
+            # empty-answers submission when no image tasks are provided.
             if not tasklist:
-                raise RuntimeError(
-                    f"hCaptcha: unsupported challenge type '{req_type}' "
-                    "with no image tasks -- cannot solve automatically."
+                print(
+                    f"    [hCaptcha/Groq] Unknown challenge type "
+                    f"'{req_type}' with no image tasks."
                 )
-            print(
-                f'    [hCaptcha/Groq] Unknown type "{req_type}" -- attempting '
-                f'batch classification on {len(tasklist)} image(s): '
-                f'"{question}" ...'
-            )
-            task_keys = []
-            image_urls = []
-            for task in tasklist:
-                tk = task.get("task_key") or task.get("datapoint_hash", "")
-                iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
-                if tk and iu:
-                    task_keys.append(tk)
-                    image_urls.append(iu)
-            batch_results = _groq_classify_batch(
-                image_urls, question, groq_client, groq_model, img_session,
-                example_data_urls=example_data_urls or None,
-            )
-            for tk, matched in zip(task_keys, batch_results):
-                answers[tk] = "true" if matched else "false"
-                print(f"      Task {tk[:10]}... -> {'yes' if matched else 'no'}")
+                print("    [hCaptcha/Groq] Asking Groq to analyse the challenge ...")
+                explanation = _groq_analyze_challenge(
+                    challenge, groq_client, groq_model
+                )
+                print(f"    [hCaptcha/Groq] Groq analysis:\n      {explanation}")
+                # Attempt to pass by submitting empty answers -- some
+                # challenge types (e.g. enterprise token challenges) require
+                # only the PoW solution and no image answers.  We proceed to
+                # the submit step below with an empty dict; if the server
+                # rejects the submission the outer retry loop will handle it,
+                # and after all retries are exhausted a clear error is raised.
+                print(
+                    "    [hCaptcha/Groq] Attempting submission with empty "
+                    "answers (no image tasks present) ..."
+                )
+                # answers stays {} -- fall through to step 5
+            else:
+                print(
+                    f'    [hCaptcha/Groq] Unknown type "{req_type}" -- attempting '
+                    f'batch classification on {len(tasklist)} image(s): '
+                    f'"{question}" ...'
+                )
+                task_keys = []
+                image_urls = []
+                for task in tasklist:
+                    tk = task.get("task_key") or task.get("datapoint_hash", "")
+                    iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                    if tk and iu:
+                        task_keys.append(tk)
+                        image_urls.append(iu)
+                batch_results = _groq_classify_batch(
+                    image_urls, question, groq_client, groq_model, img_session,
+                    example_data_urls=example_data_urls or None,
+                )
+                for tk, matched in zip(task_keys, batch_results):
+                    answers[tk] = "true" if matched else "false"
+                    print(f"      Task {tk[:10]}... -> {'yes' if matched else 'no'}")
 
         # -- 5. Submit answers ------------------------------------------------
         print("    [hCaptcha/Groq] Submitting answers ...")
