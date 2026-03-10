@@ -20,8 +20,8 @@ Supports two automation methods -- user picks at runtime:
                       the answers -- all inside this script.
                       Requires: pip install groq>=1.1.0
                       Get a free API key: https://console.groq.com
-                      Default model : meta-llama/llama-4-maverick-17b-128e-instruct
-                      Fast  model   : meta-llama/llama-4-scout-17b-16e-instruct
+                      Default model : llama-4-maverick-17b-128e-instruct
+                      Fast  model   : llama-4-scout-17b-16e-instruct
                       Supported challenge types (sourced from open-source
                       research of QIN2DIM/hcaptcha-challenger and
                       hCaptcha/hmt-basemodels):
@@ -170,9 +170,9 @@ _HCAPTCHA_GET_CHALLENGE_URL = "https://hcaptcha.com/getcaptcha"
 _HCAPTCHA_CHECK_URL        = "https://hcaptcha.com/checkcaptcha"
 
 # Llama 4 Maverick: 17 B params / 128 experts -- best Groq vision model
-GROQ_DEFAULT_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+GROQ_DEFAULT_MODEL = "llama-4-maverick-17b-128e-instruct"
 # Llama 4 Scout: 17 B params / 16 experts -- faster / lower quota usage
-GROQ_FAST_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_FAST_MODEL    = "llama-4-scout-17b-16e-instruct"
 # Max retries when Groq rate-limits an image classification call
 _GROQ_RATE_LIMIT_RETRIES = 3
 # Maximum nonce iterations for hsl/hsw proof-of-work before giving up
