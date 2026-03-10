@@ -22,7 +22,8 @@ Supports two automation methods -- user picks at runtime:
                       Get a free API key: https://console.groq.com
                       Default model : meta-llama/llama-4-maverick-17b-128e-instruct
                       Fast  model   : meta-llama/llama-4-scout-17b-16e-instruct
-                      Supports hCaptcha challenges with hsl-type proof-of-work.
+                      Supports hCaptcha challenges with hsl- and hsw-type proof-of-work.
+                      hsw requires Node.js (pkg install nodejs on Termux).
 
         "2captcha" -- Delegate to 2captcha.com (paid service).
         "capsolver" -- Delegate to capsolver.com (paid service).
@@ -68,6 +69,7 @@ import base64
 import hashlib
 import json
 import re
+import subprocess
 from urllib.parse import urlparse
 
 import pyotp
@@ -350,6 +352,90 @@ def _hcaptcha_solve_hsl_pow(req: str) -> str:
     )
 
 
+# Inline Node.js script for solving hsw proof-of-work.
+# Uses only the built-in ``crypto`` module -- no npm packages required.
+# The algorithm mirrors the hsl solver: find the smallest nonce such that
+# SHA-256(seed + nonce) starts with ``difficulty`` zero hex digits, then
+# return the base64-encoded hex digest.
+# The max iteration limit is passed as process.argv[2] from Python so that
+# _HCAPTCHA_POW_MAX_ITERATIONS is the single source of truth.
+_HCAPTCHA_HSW_NODE_SCRIPT = r"""
+const crypto = require('crypto');
+const req = process.argv[1] || '';
+const maxIter = parseInt(process.argv[2] || '10000000', 10);
+let data;
+try {
+  const padded = req + '='.repeat((4 - (req.length % 4)) % 4);
+  data = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+} catch (e) {
+  data = { d: 5, s: req };
+}
+const difficulty = data.d || 5;
+const seed = data.s || req;
+const prefix = '0'.repeat(difficulty);
+for (let nonce = 0; nonce < maxIter; nonce++) {
+  const digest = crypto.createHash('sha256').update(seed + String(nonce)).digest('hex');
+  if (digest.startsWith(prefix)) {
+    process.stdout.write(Buffer.from(digest).toString('base64'));
+    process.exit(0);
+  }
+}
+process.stderr.write(`hsw: no solution found within ${maxIter.toLocaleString()} iterations\n`);
+process.exit(1);
+""".strip()
+
+
+def _hcaptcha_solve_hsw_pow(req: str) -> str:
+    """
+    Solve an hCaptcha ``hsw``-type proof-of-work challenge using Node.js.
+
+    ``hsw`` (Hash SHA-256 Web) uses the same SHA-256 hashcash algorithm as
+    ``hsl`` but is intended to run inside a JavaScript worker context.  This
+    function delegates to a self-contained inline Node.js script so that no
+    npm packages are required -- only the built-in ``crypto`` module.
+
+    The ``req`` field is decoded from base64 JSON (same format as ``hsl``):
+    ``d`` = difficulty (leading zero hex digits), ``s`` = seed string.
+
+    Returns the base64-encoded hex-digest of the winning SHA-256 hash,
+    identical in format to the ``hsl`` solver output.
+
+    Raises ``RuntimeError`` if Node.js is not found on ``PATH`` or if no
+    valid nonce is found within the iteration limit.
+    """
+    node_exe = shutil.which("node") or shutil.which("nodejs")
+    if not node_exe:
+        raise RuntimeError(
+            "hCaptcha PoW type 'hsw'/'enterprise' requires a JavaScript runtime.\n"
+            "Install Node.js to enable the built-in hsw solver:\n"
+            "  Termux        : pkg install nodejs\n"
+            "  Debian/Ubuntu : sudo apt install nodejs\n"
+            "Alternatively, use a third-party solver (2captcha / capsolver)."
+        )
+    try:
+        result = subprocess.run(
+            [node_exe, "-e", _HCAPTCHA_HSW_NODE_SCRIPT, req,
+             str(_HCAPTCHA_POW_MAX_ITERATIONS)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "hCaptcha PoW (hsw): Node.js solver timed out after 120 s."
+        ) from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"hCaptcha PoW (hsw): Node.js solver failed -- {result.stderr.strip()}"
+        )
+    solution = result.stdout.strip()
+    if not solution:
+        raise RuntimeError(
+            "hCaptcha PoW (hsw): Node.js solver returned an empty solution."
+        )
+    return solution
+
+
 def _groq_classify_image(
     image_url: str,
     question: str,
@@ -462,7 +548,9 @@ def _solve_hcaptcha_groq(
     --------
     1. Fetch hCaptcha site config to obtain the proof-of-work descriptor and
        the current JS bundle version.
-    2. Solve the PoW in Python (``hsl`` type; SHA-256 leading-zero search).
+    2. Solve the PoW: ``hsl`` type in pure Python (SHA-256 leading-zero search);
+       ``hsw``/``enterprise`` type via an inline Node.js script (same algorithm,
+       JS runtime; requires ``node`` on PATH).
     3. POST to ``/getcaptcha`` to retrieve the image classification challenge.
     4. For each task image, ask Groq's vision model (Llama 4 Maverick by default)
        whether it matches the challenge label (yes / no per image).
@@ -472,7 +560,7 @@ def _solve_hcaptcha_groq(
     Raises ``RuntimeError`` when:
     - The ``groq`` package is not installed.
     - The Groq API key is invalid.
-    - The hCaptcha PoW type is ``hsw`` / ``enterprise`` (requires JS runtime).
+    - The hCaptcha PoW type is ``hsw``/``enterprise`` and ``node`` is not on PATH.
     - The challenge type is not ``image_label_binary``.
     - hCaptcha rejects the submitted answers.
     """
@@ -511,11 +599,9 @@ def _solve_hcaptcha_groq(
         pow_solution = _hcaptcha_solve_hsl_pow(c_obj.get("req", ""))
         print("    [hCaptcha/Groq] PoW solved.")
     elif pow_type in ("hsw", "enterprise"):
-        raise RuntimeError(
-            "hCaptcha PoW type 'hsw'/'enterprise' requires a JavaScript runtime and "
-            "cannot be solved by the built-in Python solver. "
-            "Use a third-party solver (2captcha / capsolver) for this challenge."
-        )
+        print("    [hCaptcha/Groq] Solving hsw PoW via Node.js ...")
+        pow_solution = _hcaptcha_solve_hsw_pow(c_obj.get("req", ""))
+        print("    [hCaptcha/Groq] PoW solved.")
     # No PoW when type is absent -- proceed without it.
 
     # -- 3. Get challenge -----------------------------------------------------
@@ -589,6 +675,8 @@ def _solve_hcaptcha_groq(
     second_pow = ""
     if pow_type2 == "hsl":
         second_pow = _hcaptcha_solve_hsl_pow(c_next.get("req", ""))
+    elif pow_type2 in ("hsw", "enterprise"):
+        second_pow = _hcaptcha_solve_hsw_pow(c_next.get("req", ""))
 
     ts_ms2 = int(time.time() * 1000)
     submit_payload = {
@@ -919,7 +1007,6 @@ def _chrome_user_agent() -> str:
     """Return a Chrome user-agent string using the installed version if detectable."""
     fallback = "136.0.0.0"
     try:
-        import subprocess
         for binary in ("google-chrome", "chromium-browser", "chromium",
                        os.path.join(TERMUX_USR, "bin", "chromium-browser")):
             if shutil.which(binary) or os.path.exists(binary):
