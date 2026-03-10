@@ -22,10 +22,24 @@ Supports two automation methods -- user picks at runtime:
                       Get a free API key: https://console.groq.com
                       Default model : meta-llama/llama-4-maverick-17b-128e-instruct
                       Fast  model   : meta-llama/llama-4-scout-17b-16e-instruct
-                      Supports challenge types: image_label_binary,
-                      image_label_area_select, image_label_multiple_choice,
-                      image_label_text, and unknown types with image tasks
-                      (best-effort batch classification).
+                      Supported challenge types (sourced from open-source
+                      research of QIN2DIM/hcaptcha-challenger and
+                      hCaptcha/hmt-basemodels):
+                        Image challenges (with tasklist):
+                          image_label_binary        -- yes/no per image
+                          image_label_area_select   -- click coordinates
+                          image_drag_drop           -- drag-start→end paths
+                          image_label_multiple_choice -- yes/no per candidate
+                          image_label_text          -- transcribe text
+                          (other image types)       -- best-effort batch
+                        Text challenges (no image tasklist):
+                          text_free_entry           -- free-text answer
+                          text_multiple_choice_*    -- pick correct option(s)
+                          text_label_multiple_span_select -- span selection
+                        Unknown / empty type:
+                          With images   -- best-effort binary batch
+                          Without images -- Groq explains the challenge then
+                                           attempts empty-answer submission
                       All types use multi-image batch Groq calls for speed
                       and accuracy; reference example images are included
                       automatically when hCaptcha provides them.
@@ -167,6 +181,101 @@ _HCAPTCHA_POW_MAX_ITERATIONS = 10_000_000
 _HCAPTCHA_SOLVE_RETRIES = 2
 # Maximum images sent to Groq in a single multi-image batch call
 _HCAPTCHA_BATCH_MAX = 9
+
+# ---------------------------------------------------------------------------
+# Comprehensive catalogue of all known hCaptcha request_type values.
+#
+# Sources (open-source research, 2025-03):
+#   • QIN2DIM/hcaptcha-challenger -- models.py / RequestType enum
+#     https://github.com/QIN2DIM/hcaptcha-challenger
+#   • hCaptcha/hmt-basemodels -- basemodels/constants.py
+#     https://github.com/hCaptcha/hmt-basemodels
+# ---------------------------------------------------------------------------
+_HCAPTCHA_KNOWN_CHALLENGE_TYPES: dict = {
+    # ---- Image challenges (tasklist with image URIs) ----------------------
+    "image_label_binary": (
+        "Binary yes/no classification -- each image either matches the "
+        "question label or it does not.  Solver returns 'true'/'false' per task."
+    ),
+    "image_label_area_select": (
+        "Click-to-locate challenge -- solver must identify the (x, y) "
+        "coordinates of one or more target entities within each image.  "
+        "Coordinates are normalised to [0.0, 1.0].  Sub-types: 'point' and "
+        "'bounding box'."
+    ),
+    "image_drag_drop": (
+        "Drag-and-drop spatial task -- solver must identify start and end "
+        "coordinates for one or more drag paths within the image (e.g. slide "
+        "a puzzle piece to the correct position).  Coordinates normalised to "
+        "[0.0, 1.0]."
+    ),
+    "image_label_multiple_choice": (
+        "Multiple-choice image labelling -- pick the correct candidate "
+        "image(s) from a set; solver returns 'true'/'false' per candidate."
+    ),
+    "image_label_text": (
+        "Text-in-image task -- solver must transcribe or identify specific "
+        "text visible inside each image and return the string."
+    ),
+    "image_label_area_adjust": (
+        "Bounding-box adjustment -- pre-drawn boxes are shown on each image "
+        "and the solver must resize / reposition them to better fit the target."
+    ),
+    "image_label_single_polygon": (
+        "Single-polygon drawing -- solver must outline a single target object "
+        "in each image with a polygon (sequence of vertices)."
+    ),
+    "image_label_multiple_polygons": (
+        "Multi-polygon drawing -- solver must outline all instances of the "
+        "target object in each image with separate polygons."
+    ),
+    "image_label_semantic_segmentation_one_option": (
+        "Semantic segmentation (one class) -- pixel-level labelling of one "
+        "target class per image."
+    ),
+    "image_label_semantic_segmentation_multiple_options": (
+        "Semantic segmentation (multiple classes) -- pixel-level labelling of "
+        "multiple target classes per image."
+    ),
+    "image_label_single_select": (
+        "Single-image selection from a grid -- pick exactly one matching image."
+    ),
+    "image_label_multi_select": (
+        "Multi-image selection from a grid -- pick all matching images."
+    ),
+    "image_drag_single": (
+        "Single drag-and-drop task (enterprise variant of image_drag_drop)."
+    ),
+    "image_drag_multi": (
+        "Multiple drag-and-drop tasks within one challenge."
+    ),
+    # ---- Text / NLP challenges (no image tasklist) -----------------------
+    "text_free_entry": (
+        "Free-text entry -- solver must type a textual answer to the question "
+        "posed in requester_question (no images)."
+    ),
+    "text_label_multiple_span_select": (
+        "Text-span selection -- solver highlights specific word/phrase spans "
+        "in a provided passage."
+    ),
+    "text_multiple_choice_one_option": (
+        "Single-answer text quiz -- pick exactly one correct option from a list "
+        "of text choices."
+    ),
+    "text_multiple_choice_multiple_options": (
+        "Multi-answer text quiz -- pick all correct options from a list of "
+        "text choices."
+    ),
+    # ---- Composite / special challenges ----------------------------------
+    "HCI": (
+        "General Human-Computer Interaction challenge -- exact format is "
+        "determined at runtime; may wrap any of the above types."
+    ),
+    "multi_challenge": (
+        "Composite challenge bundling multiple sub-challenges of potentially "
+        "different types into one session."
+    ),
+}
 
 # Shared browser-like request headers for hCaptcha API calls
 _HCAPTCHA_HEADERS: dict = {
@@ -820,6 +929,126 @@ def _groq_read_text_image(
     return _groq_call_vision(data_url, prompt, groq_client, model, max_tokens=60)
 
 
+def _groq_solve_drag_drop(
+    image_url: str,
+    question: str,
+    groq_client: "GroqClient",
+    model: str,
+    img_session: requests.Session,
+) -> list:
+    """
+    Ask Groq's vision model to solve an ``image_drag_drop`` hCaptcha task.
+
+    Groq is shown the image and asked to identify one or more drag-and-drop
+    paths (start → end) required to answer the challenge.  Each path is
+    returned as a dict::
+
+        {
+            "start": {"x": <float 0-1>, "y": <float 0-1>},
+            "end":   {"x": <float 0-1>, "y": <float 0-1>},
+        }
+
+    Coordinates are normalised to [0.0, 1.0] (top-left = 0,0).
+    Falls back to a centre-to-centre path on parse or download errors.
+
+    Source for challenge type:
+        QIN2DIM/hcaptcha-challenger -- models.py / RequestType.IMAGE_DRAG_DROP
+        https://github.com/QIN2DIM/hcaptcha-challenger
+    """
+    _fallback = [{"start": {"x": 0.25, "y": 0.5}, "end": {"x": 0.75, "y": 0.5}}]
+    try:
+        data_url = _download_image_as_data_url(image_url, img_session)
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return _fallback
+
+    prompt = (
+        f"Task: {question}\n\n"
+        "This is a drag-and-drop CAPTCHA image.  Identify every drag path "
+        "needed to solve the task.\n"
+        "For EACH path, output exactly one line in this format:\n"
+        "sx=<value>,sy=<value>->ex=<value>,ey=<value>\n"
+        "where sx/sy are the start x/y and ex/ey are the end x/y.\n"
+        "All values are decimal numbers between 0.0 and 1.0 "
+        "(0.0,0.0 = top-left; 1.0,1.0 = bottom-right).\n"
+        "If you cannot determine the path, output: sx=0.25,sy=0.5->ex=0.75,ey=0.5\n"
+        "Do not include any other text or explanation."
+    )
+    raw = _groq_call_vision(data_url, prompt, groq_client, model, max_tokens=120)
+
+    paths: list = []
+    for line in raw.splitlines():
+        m = re.search(
+            r'sx\s*=\s*([0-9.]+).*?sy\s*=\s*([0-9.]+).*?'
+            r'ex\s*=\s*([0-9.]+).*?ey\s*=\s*([0-9.]+)',
+            line, re.IGNORECASE,
+        )
+        if m:
+            try:
+                sx = max(0.0, min(1.0, float(m.group(1))))
+                sy = max(0.0, min(1.0, float(m.group(2))))
+                ex = max(0.0, min(1.0, float(m.group(3))))
+                ey = max(0.0, min(1.0, float(m.group(4))))
+                paths.append({"start": {"x": sx, "y": sy}, "end": {"x": ex, "y": ey}})
+            except ValueError:
+                continue
+    return paths if paths else _fallback
+
+
+def _groq_solve_text_challenge(
+    question: str,
+    challenge: dict,
+    groq_client: "GroqClient",
+    model: str,
+) -> str:
+    """
+    Ask Groq to answer a text-only hCaptcha challenge (no images).
+
+    Used for challenge types such as ``text_free_entry``,
+    ``text_multiple_choice_one_option``, and
+    ``text_multiple_choice_multiple_options``, where the challenge contains a
+    text question (``requester_question``) and optionally a restricted answer
+    set (``requester_restricted_answer_set``).
+
+    Returns the plain-text answer string chosen by the model.
+
+    Source for challenge types:
+        QIN2DIM/hcaptcha-challenger -- models.py / RequestType enum
+        https://github.com/QIN2DIM/hcaptcha-challenger
+    """
+    req_type: str = challenge.get("request_type", "")
+    restricted: dict = challenge.get("requester_restricted_answer_set", {}) or {}
+
+    type_hint = _HCAPTCHA_KNOWN_CHALLENGE_TYPES.get(req_type, "")
+    choices_block = ""
+    if restricted:
+        choice_list = "\n".join(f"  - {k}: {v}" for k, v in restricted.items())
+        choices_block = f"\nAvailable answer options:\n{choice_list}\n"
+
+    prompt = (
+        f"You are answering an hCaptcha text challenge.\n"
+        f"Challenge type: {req_type}\n"
+        f"Description: {type_hint}\n\n"
+        f"Question: {question}\n"
+        f"{choices_block}\n"
+        "Reply with ONLY the answer text (or option key if options are listed). "
+        "Do not add explanation."
+    )
+    content = [{"type": "text", "text": prompt}]
+    messages = [{"role": "user", "content": content}]
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=60,
+            temperature=0.0,
+        )
+        return (completion.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: Groq text challenge call failed: {exc}")
+        return ""
+
+
 def _groq_analyze_challenge(
     challenge: dict,
     groq_client: "GroqClient",
@@ -828,15 +1057,20 @@ def _groq_analyze_challenge(
     """
     Use Groq to explain an unknown or empty hCaptcha challenge.
 
-    Sends the raw challenge JSON (fields: request_type, requester_question,
-    tasklist length, and any extra top-level keys) to Groq as a text prompt and
-    asks it to:
+    Sends the raw challenge metadata (request_type, requester_question,
+    tasklist length, extra keys) together with the full catalogue of all
+    *known* hCaptcha challenge types to Groq, and asks it to:
       1. Identify what type of challenge this appears to be.
       2. Explain what the challenge is asking the solver to do.
       3. Suggest how to handle / solve it programmatically.
 
-    Returns the plain-text explanation from Groq (may be up to 300 tokens).
-    Falls back to an empty string on any error so callers are not blocked.
+    The catalogue of known types is sourced from:
+      • QIN2DIM/hcaptcha-challenger (models.py / RequestType enum)
+        https://github.com/QIN2DIM/hcaptcha-challenger
+      • hCaptcha/hmt-basemodels (basemodels/constants.py)
+
+    Returns the plain-text explanation from Groq (up to 400 tokens).
+    Falls back to an informative string on any error so callers are not blocked.
     """
     safe: dict = {
         "request_type":        challenge.get("request_type", ""),
@@ -848,16 +1082,23 @@ def _groq_analyze_challenge(
                          "key", "c", "generated_pass_UUID"}
         ],
     }
+
+    # Build a compact reference table of all known types for the model
+    known_types_block = "\n".join(
+        f"  • {k}: {v}" for k, v in _HCAPTCHA_KNOWN_CHALLENGE_TYPES.items()
+    )
+
     prompt = (
         "You are an expert in hCaptcha challenge analysis.\n\n"
-        "I received the following hCaptcha challenge response with an unknown or "
-        "empty request_type and no image tasks:\n\n"
+        "== Known hCaptcha request_type values ==\n"
+        f"{known_types_block}\n\n"
+        "== Received challenge (unknown / empty request_type) ==\n"
         f"{json.dumps(safe, indent=2)}\n\n"
-        "Please:\n"
-        "1. Identify what type of challenge this appears to be.\n"
+        "Based on the known types above and the received challenge fields, please:\n"
+        "1. Identify which known type this challenge most likely maps to (or state 'unknown').\n"
         "2. Explain what the challenge is asking the solver to do.\n"
         "3. Suggest how to handle or solve it programmatically.\n\n"
-        "Be concise (3-5 sentences)."
+        "Be concise (3-6 sentences)."
     )
     content = [{"type": "text", "text": prompt}]
     messages = [{"role": "user", "content": content}]
@@ -865,7 +1106,7 @@ def _groq_analyze_challenge(
         completion = groq_client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=300,
+            max_tokens=400,
             temperature=0.2,
         )
         return (completion.choices[0].message.content or "").strip()
@@ -895,19 +1136,31 @@ def _solve_hcaptcha_groq(
        when available, but is no longer required.
     3. POST to ``/getcaptcha`` with realistic mouse-movement motion data to
        retrieve the image challenge.
-    4. Dispatch by challenge type:
-       - ``image_label_binary``        -- batch-classify all images in one
-                                          Groq call; reference example images
-                                          are included when provided.
-       - ``image_label_area_select``   -- locate entity coordinates per image
-                                          (multi-point, normalised 0-1).
-       - ``image_label_multiple_choice`` -- batch yes/no per candidate.
-       - ``image_label_text``          -- read / transcribe text per image.
-       - unknown types with images     -- best-effort binary batch.
-       - unknown types with no images  -- Groq analyses the challenge and
-                                          attempts submission with empty
-                                          answers (may pass for token /
-                                          enterprise-only challenges).
+    4. Dispatch by challenge type (all known types from open-source research):
+
+       Image challenges (tasklist with image URIs):
+       - ``image_label_binary``          -- batch yes/no classification per image.
+       - ``image_label_area_select``     -- locate entity (x,y) coords per image.
+       - ``image_drag_drop``             -- drag-start to drag-end path per image.
+       - ``image_label_multiple_choice`` -- batch yes/no per candidate image.
+       - ``image_label_text``            -- transcribe text in each image.
+       - other image types               -- best-effort binary batch classification.
+
+       Text challenges (question only, no image tasklist):
+       - ``text_free_entry``             -- Groq generates a free-text answer.
+       - ``text_multiple_choice_*``      -- Groq selects the correct option(s).
+       - ``text_label_multiple_span_select`` -- Groq selects text spans.
+
+       Unknown / empty type:
+       - With image tasks   -- best-effort binary batch.
+       - Without image tasks -- Groq analyses the challenge (explains type,
+                                what it asks, how to solve it) then attempts
+                                submission with empty answers (may pass for
+                                token / enterprise-only challenges).
+
+       Sources for known types:
+         QIN2DIM/hcaptcha-challenger (models.py / RequestType enum)
+         hCaptcha/hmt-basemodels (basemodels/constants.py)
     5. POST the labelled answers with realistic motion data to
        ``/checkcaptcha``.
     6. If answers are rejected, re-fetch a fresh challenge and retry up to
@@ -1090,7 +1343,7 @@ def _solve_hcaptcha_groq(
                 print(f"      Task {tk[:10]}... -> {coords}")
 
         elif req_type == "image_label_text":
-            # Text challenge: transcribe / identify text per image.
+            # Text-in-image challenge: transcribe / identify text per image.
             print(
                 f'    [hCaptcha/Groq] Text challenge {len(tasklist)} image(s)'
                 f' [{req_type}]: "{question}" ...'
@@ -1105,6 +1358,47 @@ def _solve_hcaptcha_groq(
                 )
                 answers[tk] = text or ""
                 print(f"      Task {tk[:10]}... -> {text!r}")
+
+        elif req_type == "image_drag_drop":
+            # Drag-and-drop spatial challenge: identify start/end paths per image.
+            # Source: QIN2DIM/hcaptcha-challenger -- RequestType.IMAGE_DRAG_DROP
+            print(
+                f'    [hCaptcha/Groq] Drag-drop challenge {len(tasklist)} image(s)'
+                f' [{req_type}]: "{question}" ...'
+            )
+            for task in tasklist:
+                tk = task.get("task_key") or task.get("datapoint_hash", "")
+                iu = task.get("datapoint_uri") or task.get("datapoint_url", "")
+                if not tk or not iu:
+                    continue
+                paths = _groq_solve_drag_drop(
+                    iu, question, groq_client, groq_model, img_session
+                )
+                answers[tk] = paths
+                print(f"      Task {tk[:10]}... -> {paths}")
+
+        elif req_type in (
+            "text_free_entry",
+            "text_label_multiple_span_select",
+            "text_multiple_choice_one_option",
+            "text_multiple_choice_multiple_options",
+        ):
+            # Text-only challenge: no image tasklist -- Groq answers the question.
+            # Source: QIN2DIM/hcaptcha-challenger -- RequestType enum (text types)
+            print(
+                f'    [hCaptcha/Groq] Text-only challenge [{req_type}]: '
+                f'"{question}" ...'
+            )
+            answer_text = _groq_solve_text_challenge(
+                question, challenge, groq_client, groq_model
+            )
+            print(f"      Groq answer: {answer_text!r}")
+            # Text challenge answers are submitted as a top-level "answer" key
+            # rather than a per-task dict (best-effort; exact format may vary by
+            # site).  If the server rejects this answer, the outer retry loop
+            # will re-fetch a fresh challenge and try again; after all retries
+            # are exhausted a RuntimeError is raised with the last server response.
+            answers = {"answer": answer_text}
 
         else:
             # Best-effort for any other type: treat as binary batch when images
