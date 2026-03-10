@@ -106,7 +106,7 @@ def _chrome_user_agent() -> str:
     Uses the installed Chrome/Chromium major version when detectable,
     otherwise falls back to a recent hard-coded version.
     """
-    fallback_version = "124.0.0.0"
+    fallback_version = "136.0.0.0"  # update periodically when Chrome releases a new major version
     try:
         import subprocess
         for binary in ("google-chrome", "chromium-browser", "chromium",
@@ -694,7 +694,22 @@ def main() -> None:
         "2FA secret key (base-32, leave blank if 2FA is not enabled): "
     ).strip()
     app_name = input("Application / bot name: ").strip() or "MyDiscordBot"
-    guild_id = input("Server (Guild) ID to add the bot to: ").strip()
+
+    # --- How many bots? ---
+    while True:
+        raw = input("How many bots to create? [default: 1]: ").strip()
+        if raw == "":
+            bot_count = 1
+            break
+        try:
+            bot_count = int(raw)
+            if bot_count >= 1:
+                break
+            print("  Please enter a number greater than or equal to 1.")
+        except ValueError:
+            print("  Please enter a positive whole number (e.g. 3).")
+
+    guild_id = input("Server (Guild) ID to add the bot(s) to: ").strip()
     permissions = input(
         "Bot permissions integer [default 2048 = Send Messages, "
         "press ENTER to keep default]: "
@@ -716,29 +731,57 @@ def main() -> None:
         headless = headless_input in ("y", "yes")
 
     driver = build_driver(browser=browser, headless=headless)
+    results: list = []   # list of (name, success, token)
     try:
         login_with_token(driver, user_token)
-        client_id, _ = create_application(driver, app_name)
-        navigate_to_bot_tab(driver)
-        token = enable_intents_and_get_token(driver, totp_secret)
 
-        if token:
-            save_token(token)
-        else:
-            print(
-                "\n  ⚠ Token was not captured automatically.\n"
-                "    Copy the token from the browser and add it to tokens.txt manually."
-            )
+        for i in range(1, bot_count + 1):
+            # All bots get the exact same name (Discord allows duplicate application names).
+            # No bio or avatar is set -- the script intentionally leaves them blank.
+            bot_name = app_name
 
-        if guild_id:
-            add_bot_to_server(driver, client_id, guild_id, permissions)
-        else:
-            print("\n  -- No server ID provided; skipping bot invite step.")
+            print(f"\n{'=' * 60}")
+            print(f"  Bot {i}/{bot_count}: {bot_name}")
+            print(f"{'=' * 60}")
 
-        print("\n✓ All done!")
-        # In headless / Termux mode there is no browser window to keep open.
+            try:
+                client_id, _ = create_application(driver, bot_name)
+                navigate_to_bot_tab(driver)
+                token = enable_intents_and_get_token(driver, totp_secret)
+
+                if token:
+                    save_token(token)
+                else:
+                    print(
+                        "\n  ⚠ Token was not captured automatically.\n"
+                        "    Copy it manually from the browser and add it to tokens.txt."
+                    )
+
+                if guild_id:
+                    add_bot_to_server(driver, client_id, guild_id, permissions)
+                else:
+                    print("\n  -- No server ID provided; skipping bot invite step.")
+
+                results.append((bot_name, True, token))
+
+            except (RuntimeError, TimeoutException, NoSuchElementException,
+                    Exception) as exc:  # noqa: BLE001
+                # `KeyboardInterrupt` and `SystemExit` are BaseException subclasses and
+                # are NOT caught here, so Ctrl-C still terminates the script correctly.
+                print(f"\n  ✗ Bot '{bot_name}' failed: {exc}", file=sys.stderr)
+                results.append((bot_name, False, ""))
+
+        # --- Summary ---
+        succeeded = sum(1 for _, ok, _ in results if ok)
+        print(f"\n{'=' * 60}")
+        print(f"  Summary: {succeeded}/{bot_count} bot(s) created successfully.")
+        for name, ok, _tok in results:
+            status = "✓" if ok else "✗"
+            print(f"    {status} {name}")
+        print(f"{'=' * 60}")
+
         if not headless:
-            input("Press ENTER to close the browser …")
+            input("\nPress ENTER to close the browser ...")
     except RuntimeError as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         sys.exit(1)
