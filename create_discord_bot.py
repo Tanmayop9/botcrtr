@@ -10,10 +10,20 @@ Supports two automation methods -- user picks at runtime:
 
     hCaptcha handling (Method 1):
       Discord sometimes demands an hCaptcha solution when creating an
-      application.  Supply a captcha-solver API key at runtime to handle
-      this automatically.  Supported services:
-        - 2captcha  (https://2captcha.com)  -- service name: "2captcha"
-        - CapSolver  (https://capsolver.com)  -- service name: "capsolver"
+      application.  Three solver options are available:
+
+        "groq"     -- Built-in solver powered by Groq vision AI (FREE tier
+                      available; no third-party captcha service needed).
+                      Fetches the hCaptcha challenge images, sends them to
+                      Groq's fast LLM inference API (llama-3.2-11b-vision
+                      by default), classifies each image, and submits the
+                      answers -- all inside this script, no extra packages.
+                      Requires a free Groq API key: https://console.groq.com
+                      Supports hCaptcha challenges with hsl-type proof-of-work.
+
+        "2captcha" -- Delegate to 2captcha.com (paid service).
+        "capsolver" -- Delegate to capsolver.com (paid service).
+
       Leave the API key blank to skip automatic solving (you will receive
       an informative error instead of a silent failure).
 
@@ -44,6 +54,8 @@ Dependencies:
     pyotp>=2.9.0,<3.0.0              # both methods (2FA TOTP)
     selenium>=4.0.0,<5.0.0           # Method 2 (Browser)
     webdriver-manager>=4.0.0,<5.0.0  # Method 2 (Browser)
+    # The built-in Groq hCaptcha solver uses only the standard library
+    # (base64, hashlib, json, re) + requests -- no extra install needed.
 """
 
 import os
@@ -51,6 +63,11 @@ import sys
 import time
 import shutil
 import getpass
+import base64
+import hashlib
+import json
+import re
+from urllib.parse import urlparse
 
 import pyotp
 import requests
@@ -97,6 +114,32 @@ WAIT_TIMEOUT = 45
 MAX_CAPTCHA_POLL_ATTEMPTS = 36
 # Maximum number of application-creation attempts (initial + captcha retry)
 MAX_CAPTCHA_ATTEMPTS = 2
+
+# ---------------------------------------------------------------------------
+# Own hCaptcha solver -- Groq-powered
+# ---------------------------------------------------------------------------
+# hCaptcha public API endpoints
+_HCAPTCHA_API_JS_URL       = "https://hcaptcha.com/1/api.js"
+_HCAPTCHA_SITE_CONFIG_URL  = "https://hcaptcha.com/checksiteconfig"
+_HCAPTCHA_GET_CHALLENGE_URL = "https://hcaptcha.com/getcaptcha"
+_HCAPTCHA_CHECK_URL        = "https://hcaptcha.com/checkcaptcha"
+
+# Groq OpenAI-compatible chat completions endpoint
+GROQ_CHAT_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_DEFAULT_MODEL = "llama-3.2-11b-vision-preview"
+
+# Shared browser-like request headers for hCaptcha API calls
+_HCAPTCHA_HEADERS: dict = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://discord.com",
+    "Referer": "https://discord.com/",
+}
 
 # Termux prefix
 TERMUX_USR = "/data/data/com.termux/files/usr"
@@ -215,6 +258,308 @@ def _exchange_mfa(sess: requests.Session, error_body: dict, totp_secret: str) ->
     if not mfa_tok:
         raise RuntimeError("MFA exchange succeeded but returned no token.")
     return mfa_tok
+
+
+# ===========================================================================
+# OWN hCaptcha SOLVER -- Groq Vision AI
+# ===========================================================================
+
+def _hcaptcha_get_version() -> str:
+    """
+    Fetch the current hCaptcha JS bundle version string from the api.js URL.
+    Falls back to a known-good version string if the request fails.
+    """
+    try:
+        resp = requests.get(
+            _HCAPTCHA_API_JS_URL,
+            headers={"User-Agent": _HCAPTCHA_HEADERS["User-Agent"]},
+            timeout=10,
+            allow_redirects=True,
+        )
+        # Version appears as a path segment: /VERSION/api.js
+        m = re.search(r'/([a-f0-9]{7,})/api\.js', resp.url)
+        if m:
+            return m.group(1)
+        m = re.search(r'v=([a-f0-9]{6,})', resp.url)
+        if m:
+            return m.group(1)
+        # Also try to parse from the JS source
+        m = re.search(r'"v"\s*:\s*"([a-f0-9]{6,})"', resp.text)
+        if m:
+            return m.group(1)
+    except Exception:  # noqa: BLE001
+        pass
+    return "4e53e8c"  # safe fallback version
+
+
+def _hcaptcha_solve_hsl_pow(req: str) -> str:
+    """
+    Solve an hCaptcha ``hsl``-type proof-of-work challenge in pure Python.
+
+    The ``req`` field (from checksiteconfig ``c.req``) is a base64-encoded
+    JSON with at least a ``d`` (difficulty = number of leading zero hex digits
+    required) and an ``s`` (seed string) field.
+
+    Returns the base64-encoded hex-digest of the winning SHA-256 hash.
+    """
+    padded = req + "=" * ((4 - len(req) % 4) % 4)
+    try:
+        raw = base64.b64decode(padded).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"hCaptcha PoW (hsl): could not decode challenge -- {exc}"
+        ) from exc
+
+    difficulty: int = data.get("d", 5)
+    seed: str = data.get("s", req)
+    prefix = "0" * difficulty
+
+    for nonce in range(10_000_000):
+        digest = hashlib.sha256(f"{seed}{nonce}".encode()).hexdigest()
+        if digest.startswith(prefix):
+            return base64.b64encode(digest.encode()).decode()
+
+    raise RuntimeError(
+        "hCaptcha PoW (hsl): could not find a solution within 10 M iterations."
+    )
+
+
+def _groq_classify_image(
+    image_url: str,
+    question: str,
+    groq_api_key: str,
+    model: str,
+    img_session: requests.Session,
+) -> bool:
+    """
+    Ask Groq's vision model whether *image_url* satisfies *question*.
+
+    Downloads the image, encodes it as a base64 data-URL, and sends it to
+    the Groq chat completions endpoint.  Returns ``True`` if the model
+    answers affirmatively ("yes"), ``False`` otherwise.
+    """
+    try:
+        img_resp = img_session.get(image_url, timeout=15)
+        img_resp.raise_for_status()
+        b64_data = base64.b64encode(img_resp.content).decode()
+        mime = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        data_url = f"data:{mime};base64,{b64_data}"
+    except Exception as exc:  # noqa: BLE001
+        print(f"      Warning: could not download image {image_url}: {exc}")
+        return False
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{question}\n\n"
+                            "Reply with ONLY the single word 'yes' if the image "
+                            "contains it, or 'no' if it does not. "
+                            "Do not include any other text."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 5,
+        "temperature": 0.0,
+    }
+    resp = requests.post(
+        GROQ_CHAT_URL,
+        headers={
+            "Authorization": f"Bearer {groq_api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Groq API error: HTTP {resp.status_code} -- {resp.text[:300]}"
+        )
+    answer = (
+        resp.json()
+        .get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+        .lower()
+    )
+    return answer.startswith("y")
+
+
+def _solve_hcaptcha_groq(
+    sitekey: str,
+    pageurl: str,
+    rqdata: str,
+    groq_api_key: str,
+    groq_model: str = GROQ_DEFAULT_MODEL,
+) -> str:
+    """
+    Solve an hCaptcha challenge using the Groq vision API as the AI backend.
+
+    Pipeline
+    --------
+    1. Fetch hCaptcha site config to obtain the proof-of-work descriptor and
+       the current JS bundle version.
+    2. Solve the PoW in Python (``hsl`` type; SHA-256 leading-zero search).
+    3. POST to ``/getcaptcha`` to retrieve the image classification challenge.
+    4. For each task image, ask Groq's vision model whether it matches the
+       challenge label (yes/no per image).
+    5. POST the labelled answers to ``/checkcaptcha``.
+    6. Return the ``generated_pass_UUID`` token for use with Discord.
+
+    Raises ``RuntimeError`` for unsupported PoW types (``hsw``/``enterprise``)
+    which require a JavaScript runtime -- use a third-party solver in that case.
+    """
+    host = urlparse(pageurl).hostname or "discord.com"
+    img_session = requests.Session()
+    img_session.headers.update({"User-Agent": _HCAPTCHA_HEADERS["User-Agent"]})
+
+    # -- 1. Site config -------------------------------------------------------
+    print("    [hCaptcha/Groq] Fetching site config ...")
+    version = _hcaptcha_get_version()
+    cfg_resp = requests.get(
+        _HCAPTCHA_SITE_CONFIG_URL,
+        params={"v": version, "host": host, "sitekey": sitekey, "sc": "1", "swa": "1"},
+        headers=_HCAPTCHA_HEADERS,
+        timeout=15,
+    )
+    cfg_resp.raise_for_status()
+    config = cfg_resp.json()
+    c_obj: dict = config.get("c") or {}
+
+    # -- 2. Proof-of-work -----------------------------------------------------
+    pow_type = (c_obj.get("type") or "").lower()
+    print(f"    [hCaptcha/Groq] PoW type: {pow_type or '(none)'}")
+    pow_solution = ""
+    if pow_type == "hsl":
+        pow_solution = _hcaptcha_solve_hsl_pow(c_obj.get("req", ""))
+        print("    [hCaptcha/Groq] PoW solved.")
+    elif pow_type in ("hsw", "enterprise"):
+        raise RuntimeError(
+            "hCaptcha PoW type 'hsw'/'enterprise' requires a JavaScript runtime and "
+            "cannot be solved by the built-in Python solver. "
+            "Use a third-party solver (2captcha / capsolver) for this challenge."
+        )
+    # No PoW if type is empty or unknown -- proceed without it.
+
+    # -- 3. Get challenge -----------------------------------------------------
+    print("    [hCaptcha/Groq] Fetching challenge ...")
+    ts_ms = int(time.time() * 1000)
+    getcap_form: dict = {
+        "v": version,
+        "host": host,
+        "sitekey": sitekey,
+        "sc": "1",
+        "swa": "1",
+        "motionData": json.dumps({"st": ts_ms, "dct": ts_ms}),
+        "pdc": json.dumps({"s": ts_ms, "n": 0, "p": 0}),
+        "n": pow_solution,
+        "c": json.dumps(c_obj),
+    }
+    if rqdata:
+        getcap_form["rqdata"] = rqdata
+
+    cap_resp = requests.post(
+        f"{_HCAPTCHA_GET_CHALLENGE_URL}/{sitekey}",
+        data=getcap_form,
+        headers=_HCAPTCHA_HEADERS,
+        timeout=20,
+    )
+    cap_resp.raise_for_status()
+    challenge: dict = cap_resp.json()
+
+    # Some easy challenges pass immediately without image tasks.
+    if challenge.get("generated_pass_UUID"):
+        print("    [hCaptcha/Groq] Challenge passed automatically (no images).")
+        return challenge["generated_pass_UUID"]
+
+    req_type: str = challenge.get("request_type", "")
+    if req_type not in ("image_label_binary", "image_label_area_select"):
+        raise RuntimeError(
+            f"hCaptcha: unsupported challenge type '{req_type}'. "
+            "Only 'image_label_binary' is supported by the built-in Groq solver."
+        )
+
+    # -- 4. Classify images with Groq ----------------------------------------
+    tasklist: list = challenge.get("tasklist", [])
+    question_dict: dict = challenge.get("requester_question", {})
+    question: str = (
+        question_dict.get("en")
+        or next(iter(question_dict.values()), "Does this image match?")
+    )
+    challenge_key: str = challenge.get("key", "")
+    c_next: dict = challenge.get("c") or c_obj
+
+    print(
+        f'    [hCaptcha/Groq] Classifying {len(tasklist)} image(s) '
+        f'with {groq_model}: "{question}" ...'
+    )
+    answers: dict = {}
+    for task in tasklist:
+        task_key: str = task.get("task_key") or task.get("datapoint_hash", "")
+        image_url: str = task.get("datapoint_uri") or task.get("datapoint_url", "")
+        if not task_key or not image_url:
+            continue
+        matched = _groq_classify_image(
+            image_url, question, groq_api_key, groq_model, img_session
+        )
+        answers[task_key] = "true" if matched else "false"
+        print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
+
+    # -- 5. Submit answers ----------------------------------------------------
+    print("    [hCaptcha/Groq] Submitting answers ...")
+
+    # Second PoW may be required after receiving the challenge.
+    pow_type2 = (c_next.get("type") or "").lower() if isinstance(c_next, dict) else ""
+    second_pow = ""
+    if pow_type2 == "hsl":
+        second_pow = _hcaptcha_solve_hsl_pow(c_next.get("req", ""))
+
+    ts_ms2 = int(time.time() * 1000)
+    submit_payload = {
+        "v": version,
+        "job_mode": req_type,
+        "answers": answers,
+        "serverdomain": host,
+        "sitekey": sitekey,
+        "n": second_pow or pow_solution,
+        "c": json.dumps(c_next) if isinstance(c_next, dict) else (c_next or json.dumps(c_obj)),
+        "motionData": json.dumps({
+            "st": ts_ms2,
+            "dct": ts_ms2,
+            "mm": [[100, 200, ts_ms2]],
+        }),
+    }
+
+    submit_resp = requests.post(
+        f"{_HCAPTCHA_CHECK_URL}/{sitekey}/{challenge_key}",
+        json=submit_payload,
+        headers={**_HCAPTCHA_HEADERS, "Content-Type": "application/json"},
+        timeout=20,
+    )
+    submit_resp.raise_for_status()
+    result: dict = submit_resp.json()
+
+    token: str = result.get("generated_pass_UUID", "")
+    if not token:
+        raise RuntimeError(
+            f"hCaptcha: challenge not accepted -- response: {result}"
+        )
+
+    print("    [hCaptcha/Groq] Challenge solved successfully.")
+    return token
 
 
 def _solve_hcaptcha(
