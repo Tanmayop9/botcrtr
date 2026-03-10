@@ -6,19 +6,22 @@ Supports two automation methods -- user picks at runtime:
   Method 1 -- API  (no browser needed; works everywhere including Termux):
     Uses the Discord REST API directly via `requests`.
     No browser, no driver required.
-    Just: pip install requests pyotp
+    Just: pip install requests pyotp groq
 
     hCaptcha handling (Method 1):
       Discord sometimes demands an hCaptcha solution when creating an
       application.  Three solver options are available:
 
-        "groq"     -- Built-in solver powered by Groq vision AI (FREE tier
-                      available; no third-party captcha service needed).
-                      Fetches the hCaptcha challenge images, sends them to
-                      Groq's fast LLM inference API (llama-3.2-11b-vision
-                      by default), classifies each image, and submits the
-                      answers -- all inside this script, no extra packages.
-                      Requires a free Groq API key: https://console.groq.com
+        "groq"     -- Built-in solver powered by the official Groq Python SDK
+                      and the Llama 4 Maverick vision model.  FREE tier
+                      available; no third-party captcha service needed.
+                      Fetches the hCaptcha challenge images, classifies each
+                      one with Groq's ultra-fast LLM inference, and submits
+                      the answers -- all inside this script.
+                      Requires: pip install groq>=1.1.0
+                      Get a free API key: https://console.groq.com
+                      Default model : meta-llama/llama-4-maverick-17b-128e-instruct
+                      Fast  model   : meta-llama/llama-4-scout-17b-16e-instruct
                       Supports hCaptcha challenges with hsl-type proof-of-work.
 
         "2captcha" -- Delegate to 2captcha.com (paid service).
@@ -52,10 +55,9 @@ Desktop usage:
 Dependencies:
     requests>=2.28.0,<3.0.0          # both methods
     pyotp>=2.9.0,<3.0.0              # both methods (2FA TOTP)
+    groq>=1.1.0,<2.0.0               # Method 1 Groq hCaptcha solver (optional)
     selenium>=4.0.0,<5.0.0           # Method 2 (Browser)
     webdriver-manager>=4.0.0,<5.0.0  # Method 2 (Browser)
-    # The built-in Groq hCaptcha solver uses only the standard library
-    # (base64, hashlib, json, re) + requests -- no extra install needed.
 """
 
 import os
@@ -94,6 +96,24 @@ except ImportError:
     SELENIUM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
+# Optional Groq SDK import (Method 1 -- own hCaptcha solver).
+# Install with: pip install groq>=1.1.0
+# ---------------------------------------------------------------------------
+try:
+    from groq import Groq as GroqClient                          # type: ignore[import]
+    from groq import (                                           # type: ignore[import]
+        AuthenticationError  as GroqAuthError,
+        RateLimitError       as GroqRateLimitError,
+        BadRequestError      as GroqBadRequestError,
+        APIStatusError       as GroqAPIStatusError,
+        APIConnectionError   as GroqConnectionError,
+        APITimeoutError      as GroqTimeoutError,
+    )
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
 API_BASE  = "https://discord.com/api/v10"
@@ -124,9 +144,14 @@ _HCAPTCHA_SITE_CONFIG_URL  = "https://hcaptcha.com/checksiteconfig"
 _HCAPTCHA_GET_CHALLENGE_URL = "https://hcaptcha.com/getcaptcha"
 _HCAPTCHA_CHECK_URL        = "https://hcaptcha.com/checkcaptcha"
 
-# Groq OpenAI-compatible chat completions endpoint
-GROQ_CHAT_URL     = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_DEFAULT_MODEL = "llama-3.2-11b-vision-preview"
+# Llama 4 Maverick: 17 B params / 128 experts -- best Groq vision model
+GROQ_DEFAULT_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Llama 4 Scout: 17 B params / 16 experts -- faster / lower quota usage
+GROQ_FAST_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Max retries when Groq rate-limits an image classification call
+_GROQ_RATE_LIMIT_RETRIES = 3
+# Maximum nonce iterations for hsl proof-of-work before giving up
+_HCAPTCHA_POW_MAX_ITERATIONS = 10_000_000
 
 # Shared browser-like request headers for hCaptcha API calls
 _HCAPTCHA_HEADERS: dict = {
@@ -277,7 +302,7 @@ def _hcaptcha_get_version() -> str:
             allow_redirects=True,
         )
         # Version appears as a path segment: /VERSION/api.js
-        m = re.search(r'/([a-f0-9]{7,})/api\.js', resp.url)
+        m = re.search(r'/([a-f0-9]{6,})/api\.js', resp.url)
         if m:
             return m.group(1)
         m = re.search(r'v=([a-f0-9]{6,})', resp.url)
@@ -315,30 +340,35 @@ def _hcaptcha_solve_hsl_pow(req: str) -> str:
     seed: str = data.get("s", req)
     prefix = "0" * difficulty
 
-    for nonce in range(10_000_000):
+    for nonce in range(_HCAPTCHA_POW_MAX_ITERATIONS):
         digest = hashlib.sha256(f"{seed}{nonce}".encode()).hexdigest()
         if digest.startswith(prefix):
             return base64.b64encode(digest.encode()).decode()
 
     raise RuntimeError(
-        "hCaptcha PoW (hsl): could not find a solution within 10 M iterations."
+        f"hCaptcha PoW (hsl): could not find a solution within "
+        f"{_HCAPTCHA_POW_MAX_ITERATIONS:,} iterations."
     )
 
 
 def _groq_classify_image(
     image_url: str,
     question: str,
-    groq_api_key: str,
+    groq_client: "GroqClient",
     model: str,
     img_session: requests.Session,
 ) -> bool:
     """
-    Ask Groq's vision model whether *image_url* satisfies *question*.
+    Ask Groq's vision model whether the image at *image_url* matches *question*.
 
-    Downloads the image, encodes it as a base64 data-URL, and sends it to
-    the Groq chat completions endpoint.  Returns ``True`` if the model
-    answers affirmatively ("yes"), ``False`` otherwise.
+    Downloads the image, encodes it as a base64 data-URL, and calls
+    ``groq_client.chat.completions.create()`` with the official Groq Python SDK.
+    Returns ``True`` when the model answers "yes", ``False`` otherwise.
+
+    Automatically retries on ``GroqRateLimitError`` with exponential back-off
+    (up to ``_GROQ_RATE_LIMIT_RETRIES`` attempts).
     """
+    # --- download & encode image -----------------------------------------
     try:
         img_resp = img_session.get(image_url, timeout=15)
         img_resp.raise_for_status()
@@ -349,53 +379,71 @@ def _groq_classify_image(
         print(f"      Warning: could not download image {image_url}: {exc}")
         return False
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{question}\n\n"
-                            "Reply with ONLY the single word 'yes' if the image "
-                            "contains it, or 'no' if it does not. "
-                            "Do not include any other text."
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": 5,
-        "temperature": 0.0,
-    }
-    resp = requests.post(
-        GROQ_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {groq_api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    if not resp.ok:
-        raise RuntimeError(
-            f"Groq API error: HTTP {resp.status_code} -- {resp.text[:300]}"
-        )
-    answer = (
-        resp.json()
-        .get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-        .lower()
-    )
-    return answer.startswith("y")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"{question}\n\n"
+                        "Reply with ONLY the single word 'yes' if the image "
+                        "contains it, or 'no' if it does not. "
+                        "Do not include any other text."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                },
+            ],
+        }
+    ]
+
+    # --- call Groq SDK with retry on rate-limit --------------------------
+    for attempt in range(_GROQ_RATE_LIMIT_RETRIES):
+        try:
+            completion = groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=5,
+                temperature=0.0,
+            )
+            answer = (
+                completion.choices[0].message.content or ""
+            ).strip().lower()
+            return answer.startswith("y")
+
+        except GroqRateLimitError:
+            wait = 2 ** (attempt + 1)          # 2 s, 4 s, 8 s
+            if attempt < _GROQ_RATE_LIMIT_RETRIES - 1:
+                print(f"      Groq rate-limited; retrying in {wait}s ...")
+                time.sleep(wait)
+            else:
+                raise
+
+        except GroqAuthError as exc:
+            raise RuntimeError(
+                f"Groq authentication failed -- check your API key: {exc}"
+            ) from exc
+
+        except (GroqConnectionError, GroqTimeoutError) as exc:
+            raise RuntimeError(
+                f"Groq network error while classifying image: {exc}"
+            ) from exc
+
+        except GroqBadRequestError as exc:
+            raise RuntimeError(
+                f"Groq rejected the image classification request: {exc}"
+            ) from exc
+
+        except GroqAPIStatusError as exc:
+            raise RuntimeError(
+                f"Groq API error (HTTP {exc.status_code}): {exc.message}"
+            ) from exc
+
+    # Should not be reached; satisfies type checkers.
+    return False
 
 
 def _solve_hcaptcha_groq(
@@ -406,7 +454,10 @@ def _solve_hcaptcha_groq(
     groq_model: str = GROQ_DEFAULT_MODEL,
 ) -> str:
     """
-    Solve an hCaptcha challenge using the Groq vision API as the AI backend.
+    Solve an hCaptcha challenge using the official Groq Python SDK.
+
+    The Groq ``GroqClient`` is instantiated once and reused for every image
+    classification call, which is the recommended SDK usage pattern.
 
     Pipeline
     --------
@@ -414,20 +465,34 @@ def _solve_hcaptcha_groq(
        the current JS bundle version.
     2. Solve the PoW in Python (``hsl`` type; SHA-256 leading-zero search).
     3. POST to ``/getcaptcha`` to retrieve the image classification challenge.
-    4. For each task image, ask Groq's vision model whether it matches the
-       challenge label (yes/no per image).
+    4. For each task image, ask Groq's vision model (Llama 4 Maverick by default)
+       whether it matches the challenge label (yes / no per image).
     5. POST the labelled answers to ``/checkcaptcha``.
     6. Return the ``generated_pass_UUID`` token for use with Discord.
 
-    Raises ``RuntimeError`` for unsupported PoW types (``hsw``/``enterprise``)
-    which require a JavaScript runtime -- use a third-party solver in that case.
+    Raises ``RuntimeError`` when:
+    - The ``groq`` package is not installed.
+    - The Groq API key is invalid.
+    - The hCaptcha PoW type is ``hsw`` / ``enterprise`` (requires JS runtime).
+    - The challenge type is not ``image_label_binary``.
+    - hCaptcha rejects the submitted answers.
     """
+    if not GROQ_AVAILABLE:
+        raise RuntimeError(
+            "The 'groq' package is required for the Groq hCaptcha solver.\n"
+            "Install it with:  pip install groq>=1.1.0\n"
+            "Then re-run the script."
+        )
+
+    # Create the Groq client once; it is thread-safe and reusable.
+    groq_client = GroqClient(api_key=groq_api_key)
+
     host = urlparse(pageurl).hostname or "discord.com"
     img_session = requests.Session()
     img_session.headers.update({"User-Agent": _HCAPTCHA_HEADERS["User-Agent"]})
 
     # -- 1. Site config -------------------------------------------------------
-    print("    [hCaptcha/Groq] Fetching site config ...")
+    print(f"    [hCaptcha/Groq] Fetching site config (model: {groq_model}) ...")
     version = _hcaptcha_get_version()
     cfg_resp = requests.get(
         _HCAPTCHA_SITE_CONFIG_URL,
@@ -452,7 +517,7 @@ def _solve_hcaptcha_groq(
             "cannot be solved by the built-in Python solver. "
             "Use a third-party solver (2captcha / capsolver) for this challenge."
         )
-    # No PoW if type is empty or unknown -- proceed without it.
+    # No PoW when type is absent -- proceed without it.
 
     # -- 3. Get challenge -----------------------------------------------------
     print("    [hCaptcha/Groq] Fetching challenge ...")
@@ -486,13 +551,13 @@ def _solve_hcaptcha_groq(
         return challenge["generated_pass_UUID"]
 
     req_type: str = challenge.get("request_type", "")
-    if req_type not in ("image_label_binary", "image_label_area_select"):
+    if req_type != "image_label_binary":
         raise RuntimeError(
             f"hCaptcha: unsupported challenge type '{req_type}'. "
             "Only 'image_label_binary' is supported by the built-in Groq solver."
         )
 
-    # -- 4. Classify images with Groq ----------------------------------------
+    # -- 4. Classify images with Groq SDK ------------------------------------
     tasklist: list = challenge.get("tasklist", [])
     question_dict: dict = challenge.get("requester_question", {})
     question: str = (
@@ -503,8 +568,7 @@ def _solve_hcaptcha_groq(
     c_next: dict = challenge.get("c") or c_obj
 
     print(
-        f'    [hCaptcha/Groq] Classifying {len(tasklist)} image(s) '
-        f'with {groq_model}: "{question}" ...'
+        f'    [hCaptcha/Groq] Classifying {len(tasklist)} image(s): "{question}" ...'
     )
     answers: dict = {}
     for task in tasklist:
@@ -513,7 +577,7 @@ def _solve_hcaptcha_groq(
         if not task_key or not image_url:
             continue
         matched = _groq_classify_image(
-            image_url, question, groq_api_key, groq_model, img_session
+            image_url, question, groq_client, groq_model, img_session
         )
         answers[task_key] = "true" if matched else "false"
         print(f"      Task {task_key[:10]}... -> {'yes' if matched else 'no'}")
@@ -521,7 +585,7 @@ def _solve_hcaptcha_groq(
     # -- 5. Submit answers ----------------------------------------------------
     print("    [hCaptcha/Groq] Submitting answers ...")
 
-    # Second PoW may be required after receiving the challenge.
+    # A second PoW descriptor may arrive inside the challenge body.
     pow_type2 = (c_next.get("type") or "").lower() if isinstance(c_next, dict) else ""
     second_pow = ""
     if pow_type2 == "hsl":
@@ -535,7 +599,11 @@ def _solve_hcaptcha_groq(
         "serverdomain": host,
         "sitekey": sitekey,
         "n": second_pow or pow_solution,
-        "c": json.dumps(c_next) if isinstance(c_next, dict) else (c_next or json.dumps(c_obj)),
+        "c": (
+            json.dumps(c_next)
+            if isinstance(c_next, dict)
+            else (c_next or json.dumps(c_obj))
+        ),
         "motionData": json.dumps({
             "st": ts_ms2,
             "dct": ts_ms2,
@@ -568,18 +636,33 @@ def _solve_hcaptcha(
     rqdata: str,
     solver_key: str,
     solver_service: str = "2captcha",
+    groq_model: str = GROQ_DEFAULT_MODEL,
 ) -> str:
     """
-    Solve an hCaptcha challenge via a third-party solving service.
+    Solve an hCaptcha challenge and return the response token.
 
-    Supported *solver_service* values:
-      "2captcha"  -- https://2captcha.com  (also aliased as "2cap")
-      "capsolver" -- https://capsolver.com (also aliased as "cap")
+    *solver_service* routing
+    ------------------------
+    "groq"               -- Built-in Groq-SDK-powered solver using
+                            Llama 4 Maverick vision (recommended, free tier).
+                            *solver_key* must be a Groq API key.
+                            Install: pip install groq>=1.1.0
+    "2captcha" / "2cap"  -- Delegate to https://2captcha.com (paid).
+    "capsolver" / "cap"  -- Delegate to https://capsolver.com (paid).
 
-    Returns the captcha response token (``gRecaptchaResponse`` field) to be
-    sent back to Discord in the ``captcha_key`` body parameter.
+    Returns the token string to embed in ``captcha_key`` when retrying
+    the Discord application creation request.
     """
     svc = solver_service.lower()
+
+    if svc == "groq":
+        return _solve_hcaptcha_groq(
+            sitekey=sitekey,
+            pageurl=pageurl,
+            rqdata=rqdata,
+            groq_api_key=solver_key,
+            groq_model=groq_model,
+        )
 
     if svc in ("2captcha", "2cap"):
         base = "https://api.2captcha.com"
@@ -658,7 +741,7 @@ def _solve_hcaptcha(
 
     raise RuntimeError(
         f"Unknown captcha solver service: {solver_service!r}. "
-        "Use '2captcha' or 'capsolver'."
+        "Use 'groq', '2captcha', or 'capsolver'."
     )
 
 
@@ -667,6 +750,7 @@ def api_create_application(
     name: str,
     solver_key: str = "",
     solver_service: str = "2captcha",
+    groq_model: str = GROQ_DEFAULT_MODEL,
 ) -> dict:
     """POST /api/v10/applications -- create app, return application object.
 
@@ -688,8 +772,8 @@ def api_create_application(
                     raise RuntimeError(
                         f"create application: HTTP {resp.status_code} -- {body}\n"
                         "  Discord requires a captcha solution.  Re-run the script\n"
-                        "  and supply a captcha solver API key (2captcha or CapSolver)\n"
-                        "  when prompted, or use Method 2 (Browser) instead."
+                        "  and supply a captcha solver API key (groq, 2captcha, or\n"
+                        "  capsolver) when prompted, or use Method 2 (Browser) instead."
                     )
                 if attempt > 0:
                     raise RuntimeError(
@@ -703,6 +787,7 @@ def api_create_application(
                     rqdata=body.get("captcha_rqdata", ""),
                     solver_key=solver_key,
                     solver_service=solver_service,
+                    groq_model=groq_model,
                 )
                 payload = {"name": name, "captcha_key": captcha_token}
                 if body.get("captcha_rqtoken"):
@@ -811,9 +896,10 @@ def run_api_bot(
     permissions: str,
     solver_key: str = "",
     solver_service: str = "2captcha",
+    groq_model: str = GROQ_DEFAULT_MODEL,
 ) -> str:
     """Run the full API creation flow for one bot. Returns the token."""
-    app    = api_create_application(sess, bot_name, solver_key, solver_service)
+    app    = api_create_application(sess, bot_name, solver_key, solver_service, groq_model)
     app_id = app["id"]
     api_create_bot_user(sess, app_id)
     token  = api_reset_bot_token(sess, app_id, totp_secret)
@@ -1276,19 +1362,38 @@ def main() -> None:
     # Captcha solver inputs (API method only; ignored for Browser method)
     # ------------------------------------------------------------------
     solver_key = ""
-    solver_service = "2captcha"
+    solver_service = "groq"     # default to the built-in free solver
+    groq_model = GROQ_DEFAULT_MODEL
     if method == "api":
+        groq_note = (
+            " [RECOMMENDED, free]" if GROQ_AVAILABLE
+            else " [install: pip install groq>=1.1.0]"
+        )
         print(
             "\nCaptcha solver (optional):\n"
             "  Discord may require an hCaptcha solution when creating applications.\n"
-            "  Supported services: 2captcha (https://2captcha.com)\n"
-            "                      capsolver (https://capsolver.com)\n"
-            "  Leave blank to skip -- you will see an error if a captcha is required.\n"
+            f"  groq{groq_note}\n"
+            "      Built-in Llama 4 vision solver via Groq API.\n"
+            "      Free API key: https://console.groq.com\n"
+            "  2captcha  -- paid service: https://2captcha.com\n"
+            "  capsolver -- paid service: https://capsolver.com\n"
+            "  Leave blank to skip (an error will appear if a captcha is triggered).\n"
         )
         svc_raw = input(
-            "Captcha solver service [2captcha/capsolver, leave blank to skip]: "
+            "Captcha solver service [groq/2captcha/capsolver, leave blank to skip]: "
         ).strip().lower()
-        if svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
+        if svc_raw in ("groq",):
+            solver_service = "groq"
+            solver_key = getpass.getpass(
+                "Groq API key (input is hidden, get one free at console.groq.com): "
+            ).strip()
+            model_raw = input(
+                f"Groq model [ENTER for default '{GROQ_DEFAULT_MODEL}',\n"
+                f"  or type '{GROQ_FAST_MODEL}' for faster/cheaper]: "
+            ).strip()
+            if model_raw:
+                groq_model = model_raw
+        elif svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
             solver_service = svc_raw
             solver_key = getpass.getpass(
                 "Captcha solver API key (input is hidden): "
@@ -1330,7 +1435,7 @@ def main() -> None:
                 if method == "api":
                     run_api_bot(
                         sess, bot_name, totp_secret, guild_id, permissions,
-                        solver_key, solver_service,
+                        solver_key, solver_service, groq_model,
                     )
                 else:
                     run_browser_bot(driver, bot_name, totp_secret, guild_id, permissions)
