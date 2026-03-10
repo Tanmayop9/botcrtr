@@ -64,7 +64,6 @@ import os
 import sys
 import time
 import shutil
-import getpass
 import base64
 import hashlib
 import json
@@ -1330,10 +1329,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Common inputs
     # ------------------------------------------------------------------
-    user_token = getpass.getpass(
-        "\nDiscord user token (input is hidden): "
+    user_token = input(
+        "\nDiscord user token: "
     ).strip()
-    totp_secret = getpass.getpass(
+    totp_secret = input(
         "2FA secret key (base-32, leave blank if 2FA not enabled): "
     ).strip()
     app_name = input("Application / bot name: ").strip() or "MyDiscordBot"
@@ -1384,8 +1383,8 @@ def main() -> None:
         ).strip().lower()
         if svc_raw in ("groq",):
             solver_service = "groq"
-            solver_key = getpass.getpass(
-                "Groq API key (input is hidden, get one free at console.groq.com): "
+            solver_key = input(
+                "Groq API key (get one free at console.groq.com): "
             ).strip()
             model_raw = input(
                 f"Groq model [ENTER for default '{GROQ_DEFAULT_MODEL}',\n"
@@ -1395,8 +1394,8 @@ def main() -> None:
                 groq_model = model_raw
         elif svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
             solver_service = svc_raw
-            solver_key = getpass.getpass(
-                "Captcha solver API key (input is hidden): "
+            solver_key = input(
+                "Captcha solver API key: "
             ).strip()
 
     # ------------------------------------------------------------------
