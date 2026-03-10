@@ -636,6 +636,11 @@ def _solve_hcaptcha_groq(
         return challenge["generated_pass_UUID"]
 
     req_type: str = challenge.get("request_type", "")
+    # Some hCaptcha responses omit 'request_type' even when a binary image
+    # tasklist is present.  Fall back to 'image_label_binary' so that the
+    # solver can proceed instead of aborting with a confusing empty-type error.
+    if not req_type and challenge.get("tasklist"):
+        req_type = "image_label_binary"
     if req_type != "image_label_binary":
         raise RuntimeError(
             f"hCaptcha: unsupported challenge type '{req_type}'. "
