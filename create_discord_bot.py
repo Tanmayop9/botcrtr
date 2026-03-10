@@ -3,14 +3,15 @@ Discord Bot Creator -- EDUCATIONAL PURPOSES ONLY
 =================================================
 Supports two automation methods -- user picks at runtime:
 
-  Method 1 -- API  (recommended; works everywhere including Termux):
+  Method 1 -- API  (no browser needed; works everywhere including Termux):
     Uses the Discord REST API directly via `requests`.
-    No browser, no driver, no pkg package required.
+    No browser, no driver required.
     Just: pip install requests pyotp
 
-  Method 2 -- Browser  (requires Chrome or Firefox + matching driver):
+  Method 2 -- Browser  (Selenium; works on desktop AND Termux):
     Uses Selenium to automate the Discord Developer Portal in a real browser.
-    Does NOT work on Termux (no browser available via pkg on Termux).
+    On Termux: install Firefox + geckodriver via x11-repo (see termux_setup.sh).
+    On desktop: Chrome or Firefox with matching driver.
     Needs: pip install -r requirements.txt  (includes selenium + webdriver-manager)
 
 Per-bot steps (both methods):
@@ -22,18 +23,18 @@ Per-bot steps (both methods):
   6. Save the token to tokens.txt  (one per line)
 
 Termux usage:
-    bash termux_setup.sh          # one-time setup
-    python create_discord_bot.py  # select Method 1 at the prompt
+    bash termux_setup.sh          # one-time setup (installs x11-repo, firefox, geckodriver, selenium)
+    python create_discord_bot.py  # select Method 1 (API) or Method 2 (Browser)
 
 Desktop usage:
     pip install -r requirements.txt
     python create_discord_bot.py  # select Method 1 or 2
 
 Dependencies:
-    requests>=2.28.0,<3.0.0          # Method 1 (API) + both methods
+    requests>=2.28.0,<3.0.0          # both methods
     pyotp>=2.9.0,<3.0.0              # both methods (2FA TOTP)
-    selenium>=4.0.0,<5.0.0           # Method 2 (Browser) only
-    webdriver-manager>=4.0.0,<5.0.0  # Method 2 (Browser) only
+    selenium>=4.0.0,<5.0.0           # Method 2 (Browser)
+    webdriver-manager>=4.0.0,<5.0.0  # Method 2 (Browser)
 """
 
 import os
@@ -100,9 +101,15 @@ def is_termux() -> bool:
 
 
 def detect_browser() -> str:
-    """Return 'chrome' or 'firefox' based on what is installed."""
+    """Return 'firefox' or 'chrome' based on what is installed."""
     if is_termux():
-        return "chrome"   # only chromium is available on Termux (may still be absent)
+        # On Termux, Firefox is installed via x11-repo + pkg install firefox.
+        # geckodriver is also available: pkg install geckodriver.
+        if shutil.which("firefox"):
+            return "firefox"
+        if shutil.which("chromium-browser") or shutil.which("chromium"):
+            return "chrome"
+        return "firefox"  # default; termux_setup.sh installs Firefox
     if shutil.which("google-chrome") or shutil.which("chromium-browser") or shutil.which("chromium"):
         return "chrome"
     if shutil.which("firefox"):
@@ -723,20 +730,10 @@ def main() -> None:
             print(
                 "\n[!] Selenium is not installed. Install it with:\n"
                 "      pip install selenium webdriver-manager\n"
-                "    or switch to Method 1 (API)."
+                "    On Termux, run termux_setup.sh first.\n"
+                "    Or switch to Method 1 (API) -- no install needed."
             )
             sys.exit(1)
-        if is_termux():
-            print(
-                "\n[!] WARNING: You are on Termux.\n"
-                "    Neither Chrome nor Firefox is available via pkg on Termux.\n"
-                "    The browser method will likely fail.\n"
-                "    It is strongly recommended to use Method 1 (API) instead.\n"
-            )
-            go = input("Continue anyway? [y/N]: ").strip().lower()
-            if go not in ("y", "yes"):
-                print("Aborted. Re-run and choose Method 1.")
-                return
 
     # ------------------------------------------------------------------
     # Common inputs
@@ -780,12 +777,8 @@ def main() -> None:
         ).strip().lower()
         browser = b_raw if b_raw in ("chrome", "firefox") else default_browser
 
-        if is_termux():
-            headless = True
-            print("  (Headless forced on Termux.)")
-        else:
-            h_raw = input("Run headless? [y/N]: ").strip().lower()
-            headless = h_raw in ("y", "yes")
+        h_raw = input("Run headless? [y/N]: ").strip().lower()
+        headless = h_raw in ("y", "yes")
 
         print("\nStarting browser ...")
         driver = build_browser_driver(browser, headless)
