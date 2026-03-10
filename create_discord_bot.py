@@ -2,28 +2,31 @@
 Discord Bot Creator – EDUCATIONAL PURPOSES ONLY
 ================================================
 Automates the Discord Developer Portal to:
-  1. Log in with your Discord account credentials.
+  1. Log in by injecting your Discord account token into the browser session.
   2. Create a new application (bot).
   3. Enable all three Privileged Gateway Intents:
        • Presence Intent
        • Server Members Intent
        • Message Content Intent
-  4. Reset / reveal the bot token and save it to tokens.txt.
+  4. Reset / reveal the bot token; if your account has 2FA enabled, the
+     6-digit TOTP code is generated automatically from your 2FA secret key.
+     The bot token is saved to tokens.txt.
   5. Add the bot to a server (guild) whose ID the user provides.
 
 Usage:
     python create_discord_bot.py
 
 Dependencies (install with pip install -r requirements.txt):
-    selenium>=4.0.0
-    webdriver-manager>=4.0.0
+    selenium>=4.0.0,<5.0.0
+    webdriver-manager>=4.0.0,<5.0.0
+    pyotp>=2.9.0,<3.0.0
 """
 
-import os
 import sys
 import time
 import getpass
 
+import pyotp
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -133,32 +136,39 @@ def save_token(token: str, path: str = "tokens.txt") -> None:
 # Main workflow
 # ---------------------------------------------------------------------------
 
-def login(driver: webdriver.Chrome, email: str, password: str) -> None:
-    """Navigate to Discord login page and authenticate."""
-    print("\n[1/5] Logging in to Discord …")
+def login_with_token(driver: webdriver.Chrome, user_token: str) -> None:
+    """
+    Authenticate by injecting *user_token* directly into the browser's
+    localStorage, then navigating to the Discord app.
+
+    This avoids the email/password form and any login-page CAPTCHA.
+    The token is the value found in Discord's localStorage under the key
+    'token' (Settings → Advanced → copy from DevTools, or a third-party
+    token grabber — use only your own account).
+    """
+    print("\n[1/5] Logging in with user token …")
+
+    # Land on a Discord page first so we can write to its localStorage.
     driver.get(LOGIN_URL)
     time.sleep(2)
 
-    email_field = wait_for(driver, By.NAME, "email")
-    email_field.clear()
-    email_field.send_keys(email)
+    # Inject the token and redirect to the app.
+    driver.execute_script(
+        "window.localStorage.setItem('token', JSON.stringify(arguments[0]));"
+        "window.location.replace('https://discord.com/channels/@me');",
+        user_token,
+    )
 
-    password_field = driver.find_element(By.NAME, "password")
-    password_field.clear()
-    password_field.send_keys(password)
-
-    click(driver, By.XPATH, "//button[@type='submit']")
-
-    # Wait for the main Discord app to load (URL changes away from /login)
+    # Wait until the URL leaves the login page (token was accepted).
     try:
         WebDriverWait(driver, WAIT_TIMEOUT).until(
-            lambda d: "/login" not in d.current_url
+            lambda d: "/login" not in d.current_url and "channels" in d.current_url
         )
-        print("  ✓ Logged in successfully.")
+        print("  ✓ Logged in successfully via token.")
     except TimeoutException:
         raise RuntimeError(
-            "Login failed or took too long. "
-            "Check your credentials, or you may need to pass a CAPTCHA manually."
+            "Token login failed or took too long. "
+            "Verify that your user token is correct and not expired."
         )
 
 
@@ -236,10 +246,12 @@ def navigate_to_bot_tab(driver: webdriver.Chrome) -> None:
     time.sleep(2)
 
 
-def enable_intents_and_get_token(driver: webdriver.Chrome) -> str:
+def enable_intents_and_get_token(driver: webdriver.Chrome, totp_secret: str = "") -> str:
     """
     On the Bot settings page:
       • Reset (or reveal) the bot token and capture it.
+        If the account has 2FA enabled, the TOTP code is generated from
+        *totp_secret* and entered automatically.
       • Enable all three Privileged Gateway Intents.
     Returns the bot token string.
     """
@@ -258,7 +270,7 @@ def enable_intents_and_get_token(driver: webdriver.Chrome) -> str:
         reset_btn.click()
         time.sleep(1)
 
-        # Confirm the reset in the modal that appears
+        # --- Confirmation modal ("Yes, do it!" / "Confirm") ---
         try:
             confirm_btn = wait_clickable(
                 driver,
@@ -268,9 +280,49 @@ def enable_intents_and_get_token(driver: webdriver.Chrome) -> str:
                 timeout=10,
             )
             confirm_btn.click()
-            time.sleep(2)
+            time.sleep(1)
         except TimeoutException:
             pass  # no confirmation modal
+
+        # --- 2FA modal ---
+        # Discord shows a 6-digit TOTP input when the account has 2FA enabled.
+        try:
+            totp_input = WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located(
+                    (By.XPATH,
+                     "//input[@placeholder='6-digit authentication code' or "
+                     "@name='code' or @autocomplete='one-time-code' or "
+                     "contains(@placeholder,'digit')]")
+                )
+            )
+            if not totp_secret:
+                raise RuntimeError(
+                    "Discord is asking for a 2FA code but no --totp-secret was provided.\n"
+                    "Re-run the script and supply your 2FA secret key when prompted."
+                )
+            code = pyotp.TOTP(totp_secret).now()
+            print(f"  ✓ Generated TOTP code: {code}")
+            totp_input.clear()
+            totp_input.send_keys(code)
+            time.sleep(0.3)
+
+            # Submit the 2FA form
+            try:
+                submit_btn = wait_clickable(
+                    driver,
+                    By.XPATH,
+                    "//button[@type='submit' or "
+                    "contains(normalize-space(.), 'Log In') or "
+                    "contains(normalize-space(.), 'Verify')]",
+                    timeout=8,
+                )
+                submit_btn.click()
+            except TimeoutException:
+                # Some flows auto-submit on 6 digits — just wait
+                pass
+            time.sleep(2)
+        except TimeoutException:
+            pass  # no 2FA challenge
 
         # The token is now displayed
         token_el = WebDriverWait(driver, WAIT_TIMEOUT).until(
@@ -334,14 +386,16 @@ def enable_intents_and_get_token(driver: webdriver.Chrome) -> str:
     return token
 
 
-def add_bot_to_server(driver: webdriver.Chrome, client_id: str, guild_id: str) -> None:
+def add_bot_to_server(
+    driver: webdriver.Chrome, client_id: str, guild_id: str, permissions: str = "2048"
+) -> None:
     """
     Add the bot to the Discord server identified by *guild_id*.
 
     Builds the standard OAuth2 bot-invite URL with:
-      • scope  = bot + applications.commands
-      • permissions = 8  (Administrator – adjust as needed)
-      • guild_id pre-selected so the user isn't asked to pick a server
+      • scope       = bot + applications.commands
+      • permissions = value supplied by the caller (default: 2048 = Send Messages)
+      • guild_id    pre-selected so the user isn't asked to pick a server
       • disable_guild_select=true  to lock the dropdown to that guild
 
     The browser session is already logged in, so Discord will show the
@@ -360,7 +414,7 @@ def add_bot_to_server(driver: webdriver.Chrome, client_id: str, guild_id: str) -
     oauth_url = (
         f"https://discord.com/oauth2/authorize"
         f"?client_id={client_id}"
-        f"&permissions=8"
+        f"&permissions={permissions}"
         f"&guild_id={guild_id}"
         f"&scope=bot+applications.commands"
         f"&disable_guild_select=true"
@@ -439,8 +493,12 @@ def main() -> None:
         print("Aborted.")
         return
 
-    email = input("\nDiscord email: ").strip()
-    password = getpass.getpass("Discord password: ")
+    user_token = getpass.getpass(
+        "\nDiscord user token (input hidden): "
+    ).strip()
+    totp_secret = getpass.getpass(
+        "2FA secret key (base-32, leave blank if 2FA is not enabled): "
+    ).strip()
     app_name = input("Application / bot name: ").strip() or "MyDiscordBot"
     guild_id = input("Server (Guild) ID to add the bot to: ").strip()
     permissions = input(
@@ -452,10 +510,10 @@ def main() -> None:
 
     driver = build_driver(headless=headless)
     try:
-        login(driver, email, password)
+        login_with_token(driver, user_token)
         client_id, _ = create_application(driver, app_name)
         navigate_to_bot_tab(driver)
-        token = enable_intents_and_get_token(driver)
+        token = enable_intents_and_get_token(driver, totp_secret)
 
         if token:
             save_token(token)
