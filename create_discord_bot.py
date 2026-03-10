@@ -1,5 +1,5 @@
 """
-Discord Bot Creator – EDUCATIONAL PURPOSES ONLY
+Discord Bot Creator -- EDUCATIONAL PURPOSES ONLY
 ================================================
 Automates the Discord Developer Portal to:
   1. Log in by injecting your Discord account token into the browser session.
@@ -16,8 +16,9 @@ Automates the Discord Developer Portal to:
 Termux (Android) usage:
     Run termux_setup.sh first, then:
         python create_discord_bot.py
-    The script auto-detects Termux, defaults to Firefox (better ARM64
-    support) and forces headless mode (no display server required).
+    The script auto-detects Termux, uses Chromium (the only browser
+    available via pkg on Termux) with its bundled chromedriver, and
+    forces headless mode (no display server required).
 
 Usage (desktop):
     python create_discord_bot.py
@@ -52,7 +53,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 # ---------------------------------------------------------------------------
 DEVELOPER_PORTAL_URL = "https://discord.com/developers/applications"
 LOGIN_URL = "https://discord.com/login"
-WAIT_TIMEOUT = 30  # seconds
+WAIT_TIMEOUT = 45  # seconds -- raised to 45 to tolerate mobile CPU/network on Termux
 
 # Termux installs everything under this prefix on Android.
 TERMUX_USR = "/data/data/com.termux/files/usr"
@@ -74,18 +75,19 @@ def detect_browser() -> str:
     """
     Return 'firefox' or 'chrome' based on what is installed.
 
-    On Termux we prefer Firefox because GeckoDriver ships pre-built
-    ARM64 binaries and works out-of-the-box with webdriver-manager.
-    ChromeDriver binaries for ARM64 are not reliably available.
+    On Termux, Chromium is the only available browser via pkg:
+        pkg install chromium
+    Firefox is NOT available in the Termux main repository.
+    On desktop, Chrome/Chromium is preferred; Firefox is the fallback.
     """
     if is_termux():
-        firefox_bin = os.path.join(TERMUX_USR, "bin", "firefox")
-        chromium_bin = os.path.join(TERMUX_USR, "bin", "chromium-browser")
-        if os.path.exists(firefox_bin) or shutil.which("firefox"):
-            return "firefox"
-        if os.path.exists(chromium_bin) or shutil.which("chromium-browser") or shutil.which("chromium"):
-            return "chrome"
-        return "firefox"  # default; termux_setup.sh installs Firefox
+        for candidate in (
+            os.path.join(TERMUX_USR, "bin", "chromium-browser"),
+            os.path.join(TERMUX_USR, "bin", "chromium"),
+        ):
+            if os.path.exists(candidate) or shutil.which(os.path.basename(candidate)):
+                return "chrome"
+        return "chrome"  # default for Termux -- termux_setup.sh installs chromium
     # Desktop: prefer Chrome/Chromium, fall back to Firefox
     if shutil.which("google-chrome") or shutil.which("chromium-browser") or shutil.which("chromium"):
         return "chrome"
@@ -122,7 +124,7 @@ def _chrome_user_agent() -> str:
                         fallback_version = f"{major}.0.0.0"
                         break
                 break
-    except Exception:  # noqa: BLE001 – non-critical, gracefully degrade
+    except Exception:  # noqa: BLE001 -- non-critical, gracefully degrade
         pass
     return (
         f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -132,11 +134,45 @@ def _chrome_user_agent() -> str:
 
 
 
+def _find_chromedriver() -> str:
+    """
+    Return a path to chromedriver, checking in this order:
+      1. Paths where Termux's `pkg install chromium` places the driver
+      2. System PATH (e.g. a manually installed chromedriver)
+      3. webdriver-manager download (desktop fallback)
+    """
+    if is_termux():
+        termux_candidates = (
+            # Termux chromium package bundles the driver here:
+            os.path.join(TERMUX_USR, "lib", "chromium", "chromedriver"),
+            os.path.join(TERMUX_USR, "bin", "chromedriver"),
+        )
+        for path in termux_candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    system = shutil.which("chromedriver")
+    if system:
+        return system
+    return ChromeDriverManager().install()
+
+
+def _find_geckodriver() -> str:
+    """
+    Return a path to geckodriver, checking system PATH before downloading.
+    On Termux, `pkg install geckodriver` places it in PATH.
+    """
+    system = shutil.which("geckodriver")
+    if system:
+        return system
+    return GeckoDriverManager().install()
+
+
+def build_driver(browser: str = "chrome", headless: bool = False) -> webdriver.Remote:
     """
     Return a configured WebDriver for *browser* ('chrome' or 'firefox').
 
-    On Termux, Firefox is strongly recommended; Chrome requires a
-    manually compiled chromedriver that matches the Termux Chromium build.
+    On Termux, only Chromium is available via pkg.  The script uses
+    Termux's bundled chromedriver so no internet download is needed.
     """
     if browser == "firefox":
         return _build_firefox_driver(headless)
@@ -163,7 +199,7 @@ def _build_chrome_driver(headless: bool) -> webdriver.Chrome:
             if os.path.exists(candidate):
                 options.binary_location = candidate
                 break
-    service = ChromeService(ChromeDriverManager().install())
+    service = ChromeService(_find_chromedriver())
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
@@ -176,13 +212,16 @@ def _build_firefox_driver(headless: bool) -> webdriver.Firefox:
     """Build and return a Firefox WebDriver, Termux-aware."""
     options = FirefoxOptions()
     if headless:
-        options.add_argument("--headless")
+        options.add_argument("-headless")  # Firefox uses single-dash flag
+    # Suppress webdriver detection in Firefox
+    options.set_preference("dom.webdriver.enabled", False)
+    options.set_preference("useAutomationExtension", False)
     # On Termux, point to the Firefox binary installed via pkg.
     if is_termux():
         firefox_bin = os.path.join(TERMUX_USR, "bin", "firefox")
         if os.path.exists(firefox_bin):
             options.binary_location = firefox_bin
-    service = FirefoxService(GeckoDriverManager().install())
+    service = FirefoxService(_find_geckodriver())
     return webdriver.Firefox(service=service, options=options)
 
 
@@ -232,7 +271,7 @@ def safe_toggle_intent(driver: webdriver.Remote, label_text: str) -> None:
                 print(f"  ✓ Enabled intent: {label_text}")
                 return
         if checkboxes:
-            print(f"  – Intent already enabled: {label_text}")
+            print(f"  -- Intent already enabled: {label_text}")
         else:
             print(f"  ⚠ Could not locate toggle for intent: {label_text}")
     except (TimeoutException, NoSuchElementException) as exc:
@@ -244,6 +283,35 @@ def save_token(token: str, path: str = "tokens.txt") -> None:
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(token.strip() + "\n")
     print(f"\n✓ Token saved to '{path}'.")
+
+
+def _extract_token_from_dom(driver: webdriver.Remote) -> str:
+    """
+    Scan visible input/text elements for a Discord bot token.
+
+    Discord bot tokens have the form: <base64url>.<base64url>.<base64url>
+    This works in headless mode (no clipboard permission required).
+    """
+    import re
+    token_re = re.compile(
+        r'[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}'
+    )
+    candidates: list = driver.execute_script("""
+        var vals = [];
+        document.querySelectorAll(
+            'input[type="text"], input:not([type]), textarea, '
+            + '[class*="token" i], [class*="Token"]'
+        ).forEach(function(el) {
+            if (el.value)       vals.push(el.value);
+            if (el.textContent) vals.push(el.textContent);
+        });
+        return vals;
+    """) or []
+    for text in candidates:
+        text = str(text).strip()
+        if token_re.fullmatch(text):
+            return text
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +416,7 @@ def create_application(driver: webdriver.Remote, app_name: str) -> tuple:
             pass
 
     print(f"  ✓ Application '{app_name}' created.")
-    print(f"    Client ID : {client_id or '(could not detect – check the portal)'}")
+    print(f"    Client ID : {client_id or '(could not detect -- check the portal)'}")
     print(f"    URL       : {app_url}")
     return client_id, app_url
 
@@ -449,8 +517,13 @@ def enable_intents_and_get_token(driver: webdriver.Remote, totp_secret: str = ""
     except TimeoutException:
         pass
 
-    # Fallback: look for a "Copy" button then read the token asynchronously
-    # from the clipboard (works in non-headless mode only).
+    # Fallback 1: scan the DOM for a token-shaped string (works in headless mode).
+    if not token:
+        token = _extract_token_from_dom(driver)
+        if token:
+            print("  ✓ Token extracted from DOM.")
+
+    # Fallback 2: clipboard (non-headless desktop only -- requires user gesture).
     if not token:
         try:
             copy_btn = wait_clickable(
@@ -461,8 +534,7 @@ def enable_intents_and_get_token(driver: webdriver.Remote, totp_secret: str = ""
             )
             copy_btn.click()
             time.sleep(0.5)
-            # clipboard.readText() returns a Promise; use execute_async_script
-            # to wait for the resolved value.
+            # clipboard.readText() returns a Promise; use execute_async_script.
             token = driver.execute_async_script(
                 "var done = arguments[0];"
                 "navigator.clipboard.readText().then(done).catch(function(){done('')});"
@@ -495,7 +567,7 @@ def enable_intents_and_get_token(driver: webdriver.Remote, totp_secret: str = ""
         time.sleep(2)
         print("  ✓ Changes saved.")
     except TimeoutException:
-        print("  ⚠ 'Save Changes' button not found – changes may have been auto-saved.")
+        print("  ⚠ 'Save Changes' button not found -- changes may have been auto-saved.")
 
     return token
 
@@ -519,7 +591,7 @@ def add_bot_to_server(
 
     if not client_id:
         print(
-            "  ⚠ Client ID is missing – cannot build invite URL automatically.\n"
+            "  ⚠ Client ID is missing -- cannot build invite URL automatically.\n"
             "    Go to the OAuth2 → URL Generator tab in the Developer Portal,\n"
             "    select 'bot' scope, copy the URL, and open it manually."
         )
@@ -590,14 +662,14 @@ def add_bot_to_server(
 
 def main() -> None:
     print("=" * 60)
-    print("  Discord Bot Creator  –  EDUCATIONAL PURPOSES ONLY")
+    print("  Discord Bot Creator  --  EDUCATIONAL PURPOSES ONLY")
     print("=" * 60)
 
     on_termux = is_termux()
     if on_termux:
         print("\n  ✦ Termux environment detected.")
         print("    • Headless mode will be used (no display server).")
-        print("    • Firefox is the recommended browser on Termux.")
+        print("    • Chromium (pkg install chromium) will be used as the browser.")
         print("    • Run termux_setup.sh first if you haven't already.\n")
 
     print(
@@ -661,7 +733,7 @@ def main() -> None:
         if guild_id:
             add_bot_to_server(driver, client_id, guild_id, permissions)
         else:
-            print("\n  – No server ID provided; skipping bot invite step.")
+            print("\n  -- No server ID provided; skipping bot invite step.")
 
         print("\n✓ All done!")
         # In headless / Termux mode there is no browser window to keep open.
