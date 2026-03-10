@@ -8,6 +8,15 @@ Supports two automation methods -- user picks at runtime:
     No browser, no driver required.
     Just: pip install requests pyotp
 
+    hCaptcha handling (Method 1):
+      Discord sometimes demands an hCaptcha solution when creating an
+      application.  Supply a captcha-solver API key at runtime to handle
+      this automatically.  Supported services:
+        - 2captcha  (https://2captcha.com)  -- service name: "2captcha"
+        - CapSolver  (https://capsolver.com)  -- service name: "capsolver"
+      Leave the API key blank to skip automatic solving (you will receive
+      an informative error instead of a silent failure).
+
   Method 2 -- Browser  (Selenium; works on desktop AND Termux):
     Uses Selenium to automate the Discord Developer Portal in a real browser.
     On Termux: install Firefox + geckodriver via x11-repo (see termux_setup.sh).
@@ -83,6 +92,11 @@ ALL_PRIVILEGED_INTENTS  = _INTENT_PRESENCE | _INTENT_GUILD_MEMBERS | _INTENT_MES
 
 # Browser method timeout (seconds) -- raised to handle slow mobile/network
 WAIT_TIMEOUT = 45
+
+# Captcha solver polling: up to MAX_CAPTCHA_POLL_ATTEMPTS * 5 s ≈ 3 min
+MAX_CAPTCHA_POLL_ATTEMPTS = 36
+# Maximum number of application-creation attempts (initial + captcha retry)
+MAX_CAPTCHA_ATTEMPTS = 2
 
 # Termux prefix
 TERMUX_USR = "/data/data/com.termux/files/usr"
@@ -203,13 +217,158 @@ def _exchange_mfa(sess: requests.Session, error_body: dict, totp_secret: str) ->
     return mfa_tok
 
 
-def api_create_application(sess: requests.Session, name: str) -> dict:
-    """POST /api/v10/applications -- create app, return application object."""
+def _solve_hcaptcha(
+    sitekey: str,
+    pageurl: str,
+    rqdata: str,
+    solver_key: str,
+    solver_service: str = "2captcha",
+) -> str:
+    """
+    Solve an hCaptcha challenge via a third-party solving service.
+
+    Supported *solver_service* values:
+      "2captcha"  -- https://2captcha.com  (also aliased as "2cap")
+      "capsolver" -- https://capsolver.com (also aliased as "cap")
+
+    Returns the captcha response token (``gRecaptchaResponse`` field) to be
+    sent back to Discord in the ``captcha_key`` body parameter.
+    """
+    svc = solver_service.lower()
+
+    if svc in ("2captcha", "2cap"):
+        base = "https://api.2captcha.com"
+        task: dict = {
+            "type": "HCaptchaTaskProxyless",
+            "websiteURL": pageurl,
+            "websiteKey": sitekey,
+            "isInvisible": False,
+        }
+        if rqdata:
+            task["enterprisePayload"] = {"rqdata": rqdata}
+        cr = requests.post(
+            f"{base}/createTask",
+            json={"clientKey": solver_key, "task": task},
+            timeout=30,
+        )
+        cd = cr.json()
+        if cd.get("errorId"):
+            raise RuntimeError(
+                f"2captcha createTask error: {cd.get('errorDescription')}"
+            )
+        task_id = cd["taskId"]
+        print(f"    Captcha task submitted (id={task_id}). Waiting for solution ...")
+        for _ in range(MAX_CAPTCHA_POLL_ATTEMPTS):
+            time.sleep(5)
+            rr = requests.post(
+                f"{base}/getTaskResult",
+                json={"clientKey": solver_key, "taskId": task_id},
+                timeout=30,
+            )
+            rd = rr.json()
+            if rd.get("errorId"):
+                raise RuntimeError(
+                    f"2captcha getTaskResult error: {rd.get('errorDescription')}"
+                )
+            if rd.get("status") == "ready":
+                return rd["solution"]["gRecaptchaResponse"]
+        raise RuntimeError("2captcha: timed out waiting for captcha solution.")
+
+    if svc in ("capsolver", "cap"):
+        base = "https://api.capsolver.com"
+        task = {
+            "type": "HCaptchaTaskProxyLess",
+            "websiteURL": pageurl,
+            "websiteKey": sitekey,
+        }
+        if rqdata:
+            task["enterprisePayload"] = {"rqdata": rqdata}
+        cr = requests.post(
+            f"{base}/createTask",
+            json={"clientKey": solver_key, "task": task},
+            timeout=30,
+        )
+        cd = cr.json()
+        if cd.get("errorId"):
+            raise RuntimeError(
+                f"capsolver createTask error: {cd.get('errorDescription')}"
+            )
+        task_id = cd["taskId"]
+        print(f"    Captcha task submitted (id={task_id}). Waiting for solution ...")
+        for _ in range(MAX_CAPTCHA_POLL_ATTEMPTS):
+            time.sleep(5)
+            rr = requests.post(
+                f"{base}/getTaskResult",
+                json={"clientKey": solver_key, "taskId": task_id},
+                timeout=30,
+            )
+            rd = rr.json()
+            if rd.get("errorId"):
+                raise RuntimeError(
+                    f"capsolver getTaskResult error: {rd.get('errorDescription')}"
+                )
+            if rd.get("status") == "ready":
+                return rd["solution"]["gRecaptchaResponse"]
+        raise RuntimeError("capsolver: timed out waiting for captcha solution.")
+
+    raise RuntimeError(
+        f"Unknown captcha solver service: {solver_service!r}. "
+        "Use '2captcha' or 'capsolver'."
+    )
+
+
+def api_create_application(
+    sess: requests.Session,
+    name: str,
+    solver_key: str = "",
+    solver_service: str = "2captcha",
+) -> dict:
+    """POST /api/v10/applications -- create app, return application object.
+
+    If Discord returns an hCaptcha challenge (HTTP 400 with ``captcha_key``),
+    the challenge is solved automatically when *solver_key* is provided, and
+    the request is retried with the captcha token included.
+    """
     print(f"  [1/4] Creating application '{name}' ...")
-    resp = sess.post(f"{API_BASE}/applications", json={"name": name})
-    app = _raise_for_status(resp, "create application")
-    print(f"    Client ID: {app['id']}")
-    return app
+    payload: dict = {"name": name}
+    for attempt in range(MAX_CAPTCHA_ATTEMPTS):
+        resp = sess.post(f"{API_BASE}/applications", json=payload)
+        if resp.status_code == 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if "captcha_key" in body:
+                if not solver_key:
+                    raise RuntimeError(
+                        f"create application: HTTP {resp.status_code} -- {body}\n"
+                        "  Discord requires a captcha solution.  Re-run the script\n"
+                        "  and supply a captcha solver API key (2captcha or CapSolver)\n"
+                        "  when prompted, or use Method 2 (Browser) instead."
+                    )
+                if attempt > 0:
+                    raise RuntimeError(
+                        "create application: captcha retry failed -- "
+                        "the solved token was rejected by Discord."
+                    )
+                print(f"    Captcha required. Solving via {solver_service} ...")
+                captcha_token = _solve_hcaptcha(
+                    sitekey=body["captcha_sitekey"],
+                    pageurl="https://discord.com/developers/applications",
+                    rqdata=body.get("captcha_rqdata", ""),
+                    solver_key=solver_key,
+                    solver_service=solver_service,
+                )
+                payload = {"name": name, "captcha_key": captcha_token}
+                if body.get("captcha_rqtoken"):
+                    payload["captcha_rqtoken"] = body["captcha_rqtoken"]
+                continue  # retry with captcha token
+        app = _raise_for_status(resp, "create application")
+        print(f"    Client ID: {app['id']}")
+        return app
+    raise RuntimeError(
+        "create application: failed unexpectedly after captcha handling loop."
+    )
 
 
 def api_create_bot_user(sess: requests.Session, app_id: str) -> None:
@@ -305,9 +464,11 @@ def run_api_bot(
     totp_secret: str,
     guild_id: str,
     permissions: str,
+    solver_key: str = "",
+    solver_service: str = "2captcha",
 ) -> str:
     """Run the full API creation flow for one bot. Returns the token."""
-    app    = api_create_application(sess, bot_name)
+    app    = api_create_application(sess, bot_name, solver_key, solver_service)
     app_id = app["id"]
     api_create_bot_user(sess, app_id)
     token  = api_reset_bot_token(sess, app_id, totp_secret)
@@ -767,6 +928,28 @@ def main() -> None:
     ).strip() or "2048"
 
     # ------------------------------------------------------------------
+    # Captcha solver inputs (API method only; ignored for Browser method)
+    # ------------------------------------------------------------------
+    solver_key = ""
+    solver_service = "2captcha"
+    if method == "api":
+        print(
+            "\nCaptcha solver (optional):\n"
+            "  Discord may require an hCaptcha solution when creating applications.\n"
+            "  Supported services: 2captcha (https://2captcha.com)\n"
+            "                      capsolver (https://capsolver.com)\n"
+            "  Leave blank to skip -- you will see an error if a captcha is required.\n"
+        )
+        svc_raw = input(
+            "Captcha solver service [2captcha/capsolver, leave blank to skip]: "
+        ).strip().lower()
+        if svc_raw in ("2captcha", "2cap", "capsolver", "cap"):
+            solver_service = svc_raw
+            solver_key = getpass.getpass(
+                "Captcha solver API key (input is hidden): "
+            ).strip()
+
+    # ------------------------------------------------------------------
     # Browser-specific inputs
     # ------------------------------------------------------------------
     driver = None
@@ -800,7 +983,10 @@ def main() -> None:
 
             try:
                 if method == "api":
-                    run_api_bot(sess, bot_name, totp_secret, guild_id, permissions)
+                    run_api_bot(
+                        sess, bot_name, totp_secret, guild_id, permissions,
+                        solver_key, solver_service,
+                    )
                 else:
                     run_browser_bot(driver, bot_name, totp_secret, guild_id, permissions)
                 results.append((bot_name, True))
