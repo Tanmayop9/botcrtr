@@ -626,6 +626,82 @@ def _generate_motion_data(start_ts: int) -> dict:
     }
 
 
+def _hcaptcha_try_click_submit(
+    sitekey: str,
+    host: str,
+    version: str,
+    challenge: dict,
+    c_obj: dict,
+    pow_solution: str,
+    solve_pow_fn,
+    label: str = "hCaptcha",
+) -> str:
+    """
+    Attempt to pass an hCaptcha challenge by submitting **empty answers** with
+    click-only motion data -- no AI image analysis is performed.
+
+    This covers the common "click captcha" case: some hCaptcha configurations
+    accept a well-formed request that carries valid proof-of-work and realistic
+    mouse-movement motion data without requiring any image labels.  Examples:
+      • Low-risk passive challenges where the server trusts the client fingerprint.
+      • Enterprise / invisible hCaptcha that only validates the PoW + motion.
+      • Challenges with an empty or trivially-satisfied tasklist.
+
+    If hCaptcha accepts the click, the function returns the ``generated_pass_UUID``
+    token immediately.  If the submission is rejected (the challenge requires real
+    image answers), an empty string is returned so the caller can proceed to AI
+    analysis.
+
+    Parameters
+    ----------
+    sitekey      : hCaptcha site key for the target page.
+    host         : Hostname of the page (e.g. "discord.com").
+    version      : hCaptcha JS bundle version string.
+    challenge    : The challenge dict returned by ``/getcaptcha``.
+    c_obj        : The ``c`` object from the site config (proof-of-work descriptor).
+    pow_solution : Pre-computed PoW solution string (from site config).
+    solve_pow_fn : Callable ``(c: dict) -> str`` that solves a PoW descriptor.
+    label        : Solver label shown in log messages (e.g. "Groq", "Gemini").
+    """
+    req_type: str = challenge.get("request_type", "")
+    challenge_key: str = challenge.get("key", "")
+    c_next: dict = challenge.get("c") or c_obj
+
+    # Re-solve PoW for the submission using the challenge-level descriptor.
+    second_pow = solve_pow_fn(c_next) if isinstance(c_next, dict) else ""
+
+    ts_ms = int(time.time() * 1000)
+    motion = _generate_motion_data(ts_ms)
+    submit_payload: dict = {
+        "v":            version,
+        "job_mode":     req_type,
+        "answers":      {},   # empty = click only, no image labels
+        "serverdomain": host,
+        "sitekey":      sitekey,
+        "n":            second_pow or pow_solution,
+        "c": (
+            json.dumps(c_next)
+            if isinstance(c_next, dict)
+            else (c_next or json.dumps(c_obj))
+        ),
+        "motionData":   json.dumps(motion),
+    }
+    try:
+        resp = requests.post(
+            f"{_HCAPTCHA_CHECK_URL}/{sitekey}/{challenge_key}",
+            json=submit_payload,
+            headers={**_HCAPTCHA_HEADERS, "Content-Type": "application/json"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        token: str = resp.json().get("generated_pass_UUID", "")
+        if token:
+            print(f"    [hCaptcha/{label}] Click-only submission accepted!")
+        return token
+    except Exception:  # noqa: BLE001 -- click attempt is best-effort
+        return ""
+
+
 def _groq_call_content(
     content: list,
     groq_client: "GroqClient",
@@ -1662,6 +1738,22 @@ def _solve_hcaptcha_gemini(
         challenge_key: str = challenge.get("key", "")
         c_next: dict = challenge.get("c") or c_obj
 
+        # -- 3a. Try click-only submission first (no AI needed) ---------------
+        print("    [hCaptcha/Gemini] Trying click-only submission first ...")
+        click_token = _hcaptcha_try_click_submit(
+            sitekey=sitekey,
+            host=host,
+            version=version,
+            challenge=challenge,
+            c_obj=c_obj,
+            pow_solution=pow_solution,
+            solve_pow_fn=_solve_pow,
+            label="Gemini",
+        )
+        if click_token:
+            return click_token
+        print("    [hCaptcha/Gemini] Click-only failed; proceeding with AI analysis ...")
+
         # Collect reference example images
         example_data_urls: list = []
         for ex in challenge.get("requester_question_example", []):
@@ -2014,6 +2106,25 @@ def _solve_hcaptcha_groq(
         )
         challenge_key: str = challenge.get("key", "")
         c_next: dict = challenge.get("c") or c_obj
+
+        # -- 3a. Try click-only submission first (no AI needed) ---------------
+        # Some hCaptcha configurations accept a well-formed request with empty
+        # answers (i.e. just a checkbox click + PoW + motion data).  Attempting
+        # this before AI analysis saves API quota and is faster.
+        print("    [hCaptcha/Groq] Trying click-only submission first ...")
+        click_token = _hcaptcha_try_click_submit(
+            sitekey=sitekey,
+            host=host,
+            version=version,
+            challenge=challenge,
+            c_obj=c_obj,
+            pow_solution=pow_solution,
+            solve_pow_fn=_solve_pow,
+            label="Groq",
+        )
+        if click_token:
+            return click_token
+        print("    [hCaptcha/Groq] Click-only failed; proceeding with AI analysis ...")
 
         # Collect reference example images (visual anchor for the model)
         example_data_urls: list = []
@@ -2998,7 +3109,7 @@ def main() -> None:
             "  gemini  [free]\n"
             "      Built-in Google Gemini vision solver (REST API, no extra package).\n"
             "      Free API key: https://aistudio.google.com/apikey\n"
-            "      Free tier: 1 500 req/day, 15 RPM for Flash models.\n"
+            "      Free tier: 1,500 req/day, 15 RPM for Flash models.\n"
             "  2captcha  -- paid service: https://2captcha.com\n"
             "  capsolver -- paid service: https://capsolver.com\n"
             "  Leave blank to skip (an error will appear if a captcha is triggered).\n"
